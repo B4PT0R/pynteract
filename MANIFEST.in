@@ -1,0 +1,8 @@
+include README.md
+include LICENSE
+include pyproject.toml
+
+recursive-include pynteract *.py
+recursive-include tests *.py
+
+global-exclude __pycache__ *.py[cod]

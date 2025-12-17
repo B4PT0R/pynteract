@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pynteract"
+version = "0.1.0"
+description = "Lightweight embedded, cell-oriented Python shell (notebooks/agents) with minimal dependencies."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = [
+  "asttokens>=2.4",
+]
+
+[project.optional-dependencies]
+terminal = ["prompt-toolkit>=3.0"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+pynteract = "pynteract.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pynteract*"]
