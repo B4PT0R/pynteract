@@ -25,17 +25,17 @@ Hook Matrix
 The `Shell` class exposes hooks to customize every stage of execution. Each hook
 receives rich context so embedders can log, transform or short-circuit behaviour:
 
-- `input_hook(code)` runs before parsing the source string (logging, metrics).
-- `pre_run_hook(code)` lets you rewrite code before it is tokenized/executed.
-- `code_block_hook(code_block)` fires for every AST block (useful for tracing).
-- `pre_execute_hook(node, source)` can mutate AST nodes prior to compilation.
-- `post_execute_hook(node, result)` observes results or exceptions per node.
-- `display_hook(result)` overrides how expression values are rendered.
-- `stdout_hook(data, buffer)` / `stderr_hook(data, buffer)` redirect output streams to custom handlers.
-- `stdin_hook()` redirect stdin reads to a custom handler (web, CLI, agents).
-- `exception_hook(exc)` is invoked once a run finishes with an error.
-- `namespace_change_hook(old, new, locals)` inspects or vetoes namespace diffs.
-- `post_run_hook(response)` sees the aggregate `ShellResponse` for logging or
+- `input_hook(code, ctx)` runs before parsing the source string (logging, metrics).
+- `pre_run_hook(code, ctx)` lets you rewrite code before it is tokenized/executed.
+- `code_block_hook(code_block, ctx)` fires for every AST block (useful for tracing).
+- `pre_execute_hook(node, source, ctx)` can mutate AST nodes prior to compilation.
+- `post_execute_hook(node, result, ctx)` observes results or exceptions per node.
+- `display_hook(result, kwargs, ctx)` overrides how expression values are rendered. kwargs is a dict of any extra args passed to `Shell.display()`.
+- `stdout_hook(data, buffer, ctx)` / `stderr_hook(data, buffer, ctx)` redirect output streams to custom handlers.
+- `stdin_hook(ctx)` redirect stdin reads to a custom handler (web, CLI, agents).
+- `exception_hook(exc, ctx)` is invoked once a run finishes with an error.
+- `namespace_change_hook(old, new, locals, ctx)` inspects or vetoes namespace diffs.
+- `post_run_hook(response, ctx)` sees the aggregate `ShellResponse` for logging or
   telemetry.
 
 Hooks can be combined; each is optional and falls back to a sensible default when
@@ -64,7 +64,6 @@ import sys
 import builtins
 import ast
 import contextvars
-import inspect
 
 from collections import OrderedDict
 from asttokens import ASTTokens
@@ -177,23 +176,24 @@ class Shell:
         display(obj): Default method to display an object.
 
     Expected hooks signatures:
-        Hooks may optionally accept a final `ctx` argument (RunContext), where `ctx.name`
-        matches the synthetic/custom filename used for the current run (or any custom routing name).
+        Hooks receive a final `ctx` argument (RunContext), where `ctx.name` matches the
+        synthetic/custom filename used for the current run (or any custom routing name).
+        This routing context enables advanced late redirection and custom dynamic routing.
 
-        input_hook(code[, ctx])
-        pre_run_hook(code[, ctx]) -> processed_code
-        code_block_hook(code_block[, ctx])
-        pre_execute_hook(node, source[, ctx]) -> node
-        post_execute_hook(node, result[, ctx])
-        display_hook(result[, ctx])
-        stdout_hook(data, buffer[, ctx])
-        stderr_hook(data, buffer[, ctx])
-        stdin_hook([ctx]) -> str or None
-        exception_hook(exc[, ctx])
-        namespace_change_hook(old_globals, new_globals, locals[, ctx])
-        post_run_hook(response[, ctx]) -> response
+        input_hook(code, ctx)
+        pre_run_hook(code, ctx) -> processed_code
+        code_block_hook(code_block, ctx)
+        pre_execute_hook(node, source, ctx) -> node
+        post_execute_hook(node, result, ctx)
+        display_hook(result, kwargs, ctx)
+        stdout_hook(data, buffer, ctx)
+        stderr_hook(data, buffer, ctx)
+        stdin_hook(ctx) -> str or None
+        exception_hook(exc, ctx)
+        namespace_change_hook(old_globals, new_globals, locals, ctx)
+        post_run_hook(response, ctx) -> response
         add_script_run_ctx_hook(thread, ctx)
-        get_script_run_ctx_hook([ctx]) -> ctx
+        get_script_run_ctx_hook(ctx) -> ctx
         
     """
 
@@ -306,22 +306,8 @@ class Shell:
             ctx.run(RUN_CONTEXT.set, RunContext(name=str(name)))
         return ctx
 
-    @staticmethod
-    def _can_take_n_positional(fn: Any, n: int) -> bool:
-        try:
-            sig = inspect.signature(fn)
-        except Exception:
-            return True
-        params = list(sig.parameters.values())
-        if any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params):
-            return True
-        pos = [p for p in params if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)]
-        return len(pos) >= n
-
     def _invoke_hook(self, hook: Any, *args: Any, ctx: Any = None) -> Any:
-        if ctx is not None and self._can_take_n_positional(hook, len(args) + 1):
-            return hook(*args, ctx)
-        return hook(*args)
+        return hook(*args, ctx)
 
     @property
     def namespace(self) -> dict[str, Any]:
@@ -657,10 +643,11 @@ class Shell:
             display_hook = self.hooks.get("display_hook")
             if display_hook:
                 run_ctx = RUN_CONTEXT.get()
-                if run_ctx is not None and self._can_take_n_positional(display_hook, 2):
-                    display_hook(obj, run_ctx, **kwargs)
+                invoke = getattr(self, "_invoke_hook", None)
+                if callable(invoke):
+                    invoke(display_hook, obj, kwargs, ctx=run_ctx)
                 else:
-                    display_hook(obj, **kwargs)
+                    display_hook(obj, kwargs, run_ctx)
             else:
                 print(repr(obj))
 

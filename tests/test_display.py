@@ -6,7 +6,7 @@ from pynteract import Shell
 def test_display_mode_last_only_displays_final_expression():
     seen: list[object] = []
 
-    def display_hook(obj: object) -> None:
+    def display_hook(obj: object, _kwargs: dict, ctx) -> None:
         seen.append(obj)
 
     shell = Shell(display_mode="last", display_hook=display_hook)
@@ -19,7 +19,7 @@ def test_display_mode_last_only_displays_final_expression():
 def test_display_mode_all_displays_every_expression():
     seen: list[object] = []
 
-    def display_hook(obj: object) -> None:
+    def display_hook(obj: object, _kwargs: dict, ctx) -> None:
         seen.append(obj)
 
     shell = Shell(display_mode="all", display_hook=display_hook)
@@ -32,7 +32,7 @@ def test_display_mode_all_displays_every_expression():
 def test_semicolon_suppresses_display_but_keeps_last_result():
     seen: list[object] = []
 
-    def display_hook(obj: object) -> None:
+    def display_hook(obj: object, _kwargs: dict, ctx) -> None:
         seen.append(obj)
 
     shell = Shell(display_mode="all", display_hook=display_hook)
@@ -41,4 +41,3 @@ def test_semicolon_suppresses_display_but_keeps_last_result():
     assert resp.result == 2
     assert seen == [2]
     assert shell.namespace["_"] == 2
-

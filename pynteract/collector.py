@@ -105,5 +105,5 @@ class Collector:
                 if callable(invoke):
                     invoke(exception_hook, exc_value, ctx=RUN_CONTEXT.get())
                 else:
-                    exception_hook(exc_value)
+                    exception_hook(exc_value, RUN_CONTEXT.get())
             return True  # Suppress exception propagation

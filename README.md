@@ -156,15 +156,16 @@ while the shell is running takes effect immediately.
 ```python
 from pynteract import Shell
 
-def stdout_hook(data: str, buffer: str) -> None:
+def stdout_hook(data: str, buffer: str, ctx) -> None:
     print("STDOUT:", data, end="")
 
 shell = Shell(display_mode="none", stdout_hook=stdout_hook)
 shell.hooks["stdout_hook"] = stdout_hook  # can be swapped dynamically
 ```
 
-Hooks may optionally accept a final `ctx` argument (`RunContext`) for routing. `ctx.name` matches the synthetic/custom
-`filename` of the current run (or another routing name if you override it).
+Hooks receive a final `ctx` argument (`RunContext`) for routing. `ctx.name` matches the synthetic/custom
+`filename` of the current run (or another routing name if you override it). This routing context is intended
+for advanced late redirection or custom dynamic routing.
 
 ## Interactive terminal mode
 
@@ -314,9 +315,11 @@ Returned by `Shell.run(...)`.
 
 ### `RunContext` and context capture
 
-Hooks may receive a `RunContext` object (`ctx`) with:
+Hooks receive a `RunContext` object (`ctx`) with:
 
 - `ctx.name`: routing name (by default the synthetic/custom `filename` of the current `run()`).
+
+Use `ctx.name` as the routing key when you need late redirection (background threads) or custom dynamic routing.
 
 Use `shell.capture_context()` to propagate routing/capture context to a new thread:
 
@@ -328,22 +331,22 @@ threading.Thread(target=lambda: ctx.run(worker)).start()
 ### Hook reference
 
 All hooks are optional. Hook keys live in `shell.hooks` and are passed to `Shell(...)` via `**hooks` (kwargs must end with `_hook`).
-Most hooks may optionally accept a final `ctx: RunContext`.
+When provided, hooks must accept a final `ctx: RunContext` to support late redirection and custom dynamic routing.
 
 | Hook key | Signature | When it runs |
 | --- | --- | --- |
-| `input_hook` | `input_hook(code: str[, ctx]) -> None` | Before parsing. |
-| `pre_run_hook` | `pre_run_hook(code: str[, ctx]) -> str` | Before tokenization/execution; can rewrite source. |
-| `code_block_hook` | `code_block_hook(code_block: str[, ctx]) -> None` | For each executed AST block. |
-| `pre_execute_hook` | `pre_execute_hook(node, source[, ctx]) -> ast.AST` | Before compiling a node. |
-| `post_execute_hook` | `post_execute_hook(node, result[, ctx]) -> None` | After a node executes. |
-| `display_hook` | `display_hook(obj, **kwargs)` or `display_hook(obj, ctx, **kwargs)` | When displaying expression values. |
-| `stdout_hook` | `stdout_hook(data: str, buffer: str[, ctx]) -> None` | As stdout is flushed. |
-| `stderr_hook` | `stderr_hook(data: str, buffer: str[, ctx]) -> None` | As stderr is flushed. |
-| `stdin_hook` | `stdin_hook([ctx]) -> str | None` | For stdin reads (`None` = EOF). |
-| `exception_hook` | `exception_hook(exc: Exception[, ctx]) -> None` | When a run finishes with an error. |
-| `namespace_change_hook` | `namespace_change_hook(old, new, locals[, ctx]) -> None` | After a run, with before/after namespaces. |
-| `post_run_hook` | `post_run_hook(resp: ShellResponse[, ctx]) -> ShellResponse` | Final response override/hook. |
+| `input_hook` | `input_hook(code: str, ctx) -> None` | Before parsing. |
+| `pre_run_hook` | `pre_run_hook(code: str, ctx) -> str` | Before tokenization/execution; can rewrite source. |
+| `code_block_hook` | `code_block_hook(code_block: str, ctx) -> None` | For each executed AST block. |
+| `pre_execute_hook` | `pre_execute_hook(node, source, ctx) -> ast.AST` | Before compiling a node. |
+| `post_execute_hook` | `post_execute_hook(node, result, ctx) -> None` | After a node executes. |
+| `display_hook` | `display_hook(obj, kwargs, ctx) -> None` | When displaying expression values. |
+| `stdout_hook` | `stdout_hook(data: str, buffer: str, ctx) -> None` | As stdout is flushed. |
+| `stderr_hook` | `stderr_hook(data: str, buffer: str, ctx) -> None` | As stderr is flushed. |
+| `stdin_hook` | `stdin_hook(ctx) -> str | None` | For stdin reads (`None` = EOF). |
+| `exception_hook` | `exception_hook(exc: Exception, ctx) -> None` | When a run finishes with an error. |
+| `namespace_change_hook` | `namespace_change_hook(old, new, locals, ctx) -> None` | After a run, with before/after namespaces. |
+| `post_run_hook` | `post_run_hook(resp: ShellResponse, ctx) -> ShellResponse` | Final response override/hook. |
 
 ### Configuration files
 

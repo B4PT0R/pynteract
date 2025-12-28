@@ -5,7 +5,7 @@ import sys
 from .ptk import prompt
 from .context import CAPTURE_STREAMS, RUN_CONTEXT, SILENT_STDIO, PENDING_STDIN_PROMPT
 
-def stdout_write(data: str, buffer: str) -> None:
+def stdout_write(data: str, buffer: str, ctx) -> None:
     """Default stdout hook that mirrors captured output to the real stdout."""
     if isinstance(sys.stdout, (Stream, StdIOProxy)):
         sys.__stdout__.write(data)
@@ -14,7 +14,7 @@ def stdout_write(data: str, buffer: str) -> None:
         sys.stdout.write(data)
         sys.stdout.flush()
 
-def stderr_write(data: str, buffer: str) -> None:
+def stderr_write(data: str, buffer: str, ctx) -> None:
     """Default stderr hook that mirrors captured output to the real stderr."""
     if isinstance(sys.stderr, (Stream, StdIOProxy)):
         sys.__stderr__.write(data)
@@ -23,7 +23,7 @@ def stderr_write(data: str, buffer: str) -> None:
         sys.stderr.write(data)
         sys.stderr.flush()
 
-def stdin_readline() -> str:
+def stdin_readline(ctx) -> str:
     """Fallback stdin hook that reads from the console."""
     if isinstance(sys.stdin, StdinProxy):
         try:
@@ -97,7 +97,7 @@ class Stream(io.IOBase):
         shell: object,
         *,
         hook_key: str,
-        default_hook: Callable[[str, str], None],
+        default_hook: Callable[[str, str, object], None],
         delegate: Optional[io.TextIOBase] = None,
         buffer_size: int = 2048,
     ) -> None:
@@ -239,7 +239,7 @@ class Stream(io.IOBase):
             if callable(invoke):
                 invoke(hook, data_to_flush, self.cache_buffer, ctx=ctx)
             else:
-                hook(data_to_flush, self.cache_buffer)
+                hook(data_to_flush, self.cache_buffer, ctx)
         
 
     def get_value(self) -> str:
@@ -264,7 +264,7 @@ class StdinProxy(io.TextIOBase):
         self,
         shell: object,
         *,
-        default_hook: Callable[[], str],
+        default_hook: Callable[[object], str],
         encoding: str = "utf-8",
     ) -> None:
         super().__init__()
@@ -314,7 +314,7 @@ class StdinProxy(io.TextIOBase):
         if callable(invoke):
             chunk = invoke(hook, ctx=ctx)
         else:
-            chunk = hook()
+            chunk = hook(ctx)
 
         if chunk is None:
             self._eof = True
@@ -430,13 +430,21 @@ class StdIOProxy(io.TextIOBase):
         return buf
 
     def flush(self) -> None:  # type: ignore[override]
+        if getattr(self._delegate, "closed", False):
+            return
         capture = CAPTURE_STREAMS.get()
         if capture is not None:
             sink = capture[self._index]
             if hasattr(sink, "flush"):
-                sink.flush()
+                try:
+                    sink.flush()
+                except ValueError:
+                    return
                 return
-        self._delegate.flush()
+        try:
+            self._delegate.flush()
+        except ValueError:
+            return
 
     def write(self, s: str) -> int:  # type: ignore[override]
         if s is None:

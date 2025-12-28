@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import io
+
 from pynteract import Shell
+from pynteract.streams import StdIOProxy
 
 
 def test_stream_exposes_encoding_and_isatty_like_real_stdout():
@@ -58,3 +61,10 @@ def test_user_code_can_redirect_sys_stdout_without_breaking_shell_capture():
     assert resp.exception is None
     assert (resp.stdout or "") == "a\nc\n"
     assert shell.namespace["captured_b"] == "b\n"
+
+
+def test_stdio_proxy_flush_noops_when_delegate_closed():
+    delegate = io.StringIO()
+    proxy = StdIOProxy(delegate, which="stdout")
+    delegate.close()
+    proxy.flush()
