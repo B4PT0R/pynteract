@@ -1,4 +1,5 @@
 import io
+import asyncio
 from typing import Optional, Callable
 from collections import deque
 import sys
@@ -42,6 +43,50 @@ def stdin_readline(ctx) -> str:
     else:
         return sys.stdin.readline()
 
+
+def _fire_async_hook(coro, loop=None) -> None:
+    """Schedule a coroutine on the running event loop, if any.
+
+    Called from synchronous stream-flush paths when a hook turns out to be a
+    coroutine function.  Three strategies are tried in order:
+
+    1. ``loop`` is provided explicitly (cross-thread path from ``arun``) →
+       ``loop.call_soon_threadsafe`` schedules the task on the caller's loop.
+    2. A running loop exists in *this* thread → ``asyncio.ensure_future``.
+    3. No usable loop → the coroutine is closed and a ``RuntimeWarning`` is emitted.
+
+    Args:
+        coro: The coroutine to schedule.
+        loop: Optional event loop to use. When provided (e.g. captured by
+              ``Shell.arun`` before offloading to a thread), cross-thread
+              scheduling is used unconditionally.
+    """
+    # Fast path: caller supplied an explicit loop (cross-thread from arun).
+    if loop is not None and not loop.is_closed():
+        loop.call_soon_threadsafe(loop.create_task, coro)
+        return
+
+    # Same-thread path: try to find the running loop.
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+
+    if running is not None:
+        asyncio.ensure_future(coro, loop=running)
+        return
+
+    # No usable loop — warn and discard.
+    coro.close()
+    import warnings
+    warnings.warn(
+        "An async stream hook was called but no event loop is available; "
+        "hook output will be dropped.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
 class Stream(io.IOBase):
     """
     Custom io stream that intercepts stdout and stderr streams.
@@ -49,6 +94,12 @@ class Stream(io.IOBase):
     This class manages text data by buffering it and optionally passing it through a hook
     for real-time processing and display. It ensures efficient data handling by
     maintaining a maximum buffer size and flushing data when this size is exceeded or on newlines.
+
+    Hooks may be either plain callables **or async coroutine functions**.  When an
+    async hook is detected during ``flush()``, it is scheduled on the running event
+    loop via :func:`_fire_async_hook` so that the synchronous write path is never
+    blocked.  This makes ``Stream`` transparently compatible with both sync and async
+    embedders (e.g. ``Shell.run`` and ``Shell.arun``).
 
     Args:
         shell: Shell instance whose hook attribute is consulted dynamically.
@@ -112,6 +163,7 @@ class Stream(io.IOBase):
         self.buffer_size = buffer_size
         self._pending_buffer = ""
         self.cache_buffer = ""
+        self._loop: Optional[asyncio.AbstractEventLoop] = None  # set by Shell.arun()
 
     def writable(self) -> bool:
         return True
@@ -194,25 +246,30 @@ class Stream(io.IOBase):
         for line in lines:
             self.flush(line + '\n')
 
-        # Handle buffer overflow
-        while len(self._pending_buffer) > self.buffer_size:
-            self.flush(self._pending_buffer[:self.buffer_size])
-            self._pending_buffer = self._pending_buffer[self.buffer_size:]
+        # Flush if buffer exceeds size limit
+        if len(self._pending_buffer) >= self.buffer_size:
+            self.flush()
 
         return len(data)
 
-    def flush(self, data_to_flush: Optional[str] = None) -> None:
-        """
-        Flushes the given data to the hook and caches it.
+    def flush(self, data_to_flush=None) -> None:  # type: ignore[override]
+        """Flush buffered data through the hook (sync or async).
+
+        When the resolved hook is a plain callable it is invoked synchronously,
+        preserving the original behaviour.  When it is a coroutine function the
+        resulting coroutine is scheduled on the running event loop via
+        :func:`_fire_async_hook` — the flush call returns immediately without
+        blocking.
 
         Args:
             data_to_flush (str, optional): The data to flush. If None, flushes the current buffer.
-
-        This method processes the data through the hook (if set) and adds it to the cache buffer.
         """
         if data_to_flush is None:
             data_to_flush = self._pending_buffer
             self._pending_buffer = ""
+
+        if not data_to_flush:
+            return
 
         self.cache_buffer += data_to_flush
 
@@ -233,14 +290,28 @@ class Stream(io.IOBase):
         hook = hooks.get(self._hook_key)
         if hook is None:
             hook = self._default_hook
-        if hook:
-            ctx = RUN_CONTEXT.get()
-            invoke = getattr(self._shell, "_invoke_hook", None)
+        if hook is None:
+            return
+
+        ctx = RUN_CONTEXT.get()
+        invoke = getattr(self._shell, "_invoke_hook", None)
+
+        if asyncio.iscoroutinefunction(hook):
+            # Async hook: call directly (bypassing _invoke_hook which is sync-only)
+            # and schedule the coroutine on the event loop.
+            # Shell.arun() stores the caller's loop on shell._arun_loop before
+            # offloading to a thread — pick it up here for cross-thread scheduling.
+            arun_loop = getattr(self._shell, "_arun_loop", None)
+            effective_loop = arun_loop or getattr(self, "_loop", None)
+            coro = hook(data_to_flush, self.cache_buffer, ctx)
+            _fire_async_hook(coro, loop=effective_loop)
+        else:
+            # Sync hook: go through _invoke_hook when available (preserves shell
+            # instrumentation such as Streamlit ctx injection), otherwise call directly.
             if callable(invoke):
                 invoke(hook, data_to_flush, self.cache_buffer, ctx=ctx)
             else:
                 hook(data_to_flush, self.cache_buffer, ctx)
-        
 
     def get_value(self) -> str:
         """

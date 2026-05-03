@@ -7,6 +7,8 @@ class Collector:
     Manages stdout and stderr redirection within a context manager.
 
     This class captures all output and exceptions, allowing fine control over their handling and display.
+    Supports both synchronous (``with``) and asynchronous (``async with``) usage — the async variant
+    delegates to the same sync enter/exit logic since stream redirection is inherently synchronous.
 
     Attributes:
         shell: Shell instance whose hooks are consulted dynamically.
@@ -46,6 +48,8 @@ class Collector:
             str: The entire content written to stderr.
         """
         return self.stderr_stream.get_value()
+
+    # ------------------------------------------------------------------ sync --
 
     def __enter__(self):
         """
@@ -107,3 +111,29 @@ class Collector:
                 else:
                     exception_hook(exc_value, RUN_CONTEXT.get())
             return True  # Suppress exception propagation
+
+    # ----------------------------------------------------------------- async --
+
+    async def __aenter__(self):
+        """Async entry — delegates to the synchronous ``__enter__``.
+
+        Stream redirection is a synchronous operation (``sys.stdout`` assignment);
+        there is nothing inherently async here.  The async variant exists so that
+        ``Collector`` can be used inside ``async with`` blocks without ceremony.
+
+        Returns:
+            Collector: The Collector instance.
+        """
+        return self.__enter__()
+
+    async def __aexit__(self, exc_type, exc_value, exc_traceback):
+        """Async exit — delegates to the synchronous ``__exit__``.
+
+        Flushing and stream restoration are synchronous.  Any async hooks fired
+        during execution have already been scheduled by ``Stream.flush()``; we do
+        not need to await them here.
+
+        Returns:
+            bool: True if the exception was handled, False otherwise.
+        """
+        return self.__exit__(exc_type, exc_value, exc_traceback)

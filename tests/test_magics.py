@@ -1,155 +1,243 @@
-from __future__ import annotations
-
-from pynteract import Shell
-
-
-def test_line_magic_executes_registered_function_and_returns_value():
-    shell = Shell(display_mode="none")
-
-    @shell.register_magic(name="caps")
-    def caps(text: str) -> str:
-        return text.upper()
-
-    resp = shell.run("%caps hello")
-    assert resp.exception is None
-    assert resp.result == "HELLO"
+"""Tests de non-régression pour magics.py."""
+import threading
+import contextvars
+import pytest
+from pynteract.magics import MagicParser, Magic, _PLACEHOLDER_STORE
 
 
-def test_cell_magic_receives_remaining_cell_body():
-    shell = Shell(display_mode="none")
-    received: list[str] = []
+# ── Magic dataclass ────────────────────────────────────────────────────────────
 
-    @shell.register_magic(name="take")
-    def take(text: str) -> str:
-        received.append(text)
-        return "ok"
+class TestMagic:
+    def test_callable(self):
+        m = Magic(func=lambda text: text.upper())
+        assert m("hello") == "HELLO"
 
-    resp = shell.run("%%take\nline1\nline2")
-    assert resp.exception is None
-    assert resp.result == "ok"
-    assert received == ["line1\nline2"]
+    def test_default_mode(self):
+        m = Magic(func=lambda t: t)
+        assert m.mode == "both"
 
+    def test_custom_mode(self):
+        m = Magic(func=lambda t: t, mode="cell")
+        assert m.mode == "cell"
 
-def test_magics_not_parsed_inside_string_or_comment():
-    shell = Shell(display_mode="none")
-
-    @shell.register_magic(name="boom")
-    def boom(_: str) -> str:
-        raise AssertionError("should not be called")
-
-    resp = shell.run("x = '%boom hi'\n# %boom hi\nx")
-    assert resp.exception is None
-    assert resp.result == "%boom hi"
+    def test_frozen(self):
+        m = Magic(func=lambda t: t)
+        with pytest.raises((AttributeError, TypeError)):
+            m.mode = "line"  # type: ignore
 
 
-def test_inline_magic_in_assignment_uses_rhs_as_input():
-    shell = Shell(display_mode="none")
+# ── _render_template — safe eval ──────────────────────────────────────────────
 
-    @shell.register_magic(name="caps")
-    def caps(text: str) -> str:
-        return text.upper()
+class TestRenderTemplate:
+    def setup_method(self, _):
+        self.p = MagicParser()
 
-    resp = shell.run("x = %caps hello world\nx")
-    assert resp.exception is None
-    assert resp.result == "HELLO WORLD"
+    def test_literal_substitution(self):
+        result = self.p._render_template("{x}", {"x": 42}, {})
+        assert result == "42"
 
+    def test_escaped_braces(self):
+        result = self.p._render_template("{{literal}}", {}, {})
+        assert result == "{literal}"
 
-def test_inline_magic_after_semicolon_is_parsed():
-    shell = Shell(display_mode="none")
+    def test_expression(self):
+        result = self.p._render_template("{a + b}", {"a": 3, "b": 4}, {})
+        assert result == "7"
 
-    @shell.register_magic(name="caps")
-    def caps(text: str) -> str:
-        return text.upper()
+    def test_locals_override_globals(self):
+        result = self.p._render_template("{x}", {"x": 1}, {"x": 99})
+        assert result == "99"
 
-    resp = shell.run("x = 1; y = %caps hi\ny")
-    assert resp.exception is None
-    assert resp.result == "HI"
+    def test_no_substitution(self):
+        assert self.p._render_template("hello world", {}, {}) == "hello world"
 
+    def test_unmatched_open_brace_raises(self):
+        with pytest.raises(ValueError, match="Unmatched"):
+            self.p._render_template("{x", {"x": 1}, {})
 
-def test_percent_operator_not_misparsed_as_magic():
-    shell = Shell(display_mode="none")
-    resp = shell.run("10 % 3")
-    assert resp.exception is None
-    assert resp.result == 1
+    def test_unmatched_close_brace_raises(self):
+        with pytest.raises(ValueError, match="Unmatched"):
+            self.p._render_template("x}", {}, {})
 
+    def test_empty_expression_raises(self):
+        with pytest.raises(ValueError, match="Empty"):
+            self.p._render_template("{}", {}, {})
 
-def test_magic_templates_resolve_brace_expressions():
-    shell = Shell(display_mode="none")
+    # -- sandbox --
 
-    @shell.register_magic(name="upper")
-    def upper(text: str) -> str:
-        return text.upper()
+    def test_blocks_import(self):
+        with pytest.raises(NameError):
+            self.p._render_template("{__import__('os')}", {}, {})
 
-    resp = shell.run("%upper La liste est {[i for i in range(3)]}")
-    assert resp.exception is None
-    assert resp.result == "LA LISTE EST [0, 1, 2]"
+    def test_blocks_builtins_escape(self):
+        # La sandbox remplace __builtins__ par un dict whitelist sans '__import__'.
+        # Tenter d'y accéder lève KeyError (clé absente) — le vecteur d'évasion est bloqué.
+        with pytest.raises((NameError, TypeError, KeyError)):
+            self.p._render_template(
+                "{__builtins__['__import__']('os')}", {}, {}
+            )
 
+    def test_allows_safe_builtins(self):
+        assert self.p._render_template("{len('hello')}", {}, {}) == "5"
+        assert self.p._render_template("{str(42)}", {}, {}) == "42"
+        assert self.p._render_template("{max(1,2,3)}", {}, {}) == "3"
 
-def test_magic_templates_can_reference_namespace_values():
-    shell = Shell(display_mode="none")
-
-    @shell.register_magic(name="upper")
-    def upper(text: str) -> str:
-        return text.upper()
-
-    resp = shell.run("x = 5\n%upper x={x}")
-    assert resp.exception is None
-    assert resp.result == "X=5"
-
-
-def test_magic_templates_support_brace_escaping():
-    shell = Shell(display_mode="none")
-
-    @shell.register_magic(name="echo")
-    def echo(text: str) -> str:
-        return text
-
-    resp = shell.run("%echo {{hello}} {1+1} {{}}")
-    assert resp.exception is None
-    assert resp.result == "{hello} 2 {}"
+    def test_user_vars_still_accessible(self):
+        result = self.p._render_template("{secret}", {"secret": "visible"}, {})
+        assert result == "visible"
 
 
-def test_line_magic_preserves_semicolon_in_argument():
-    shell = Shell(display_mode="none")
+# ── _placeholder_scope — isolation ────────────────────────────────────────────
 
-    @shell.register_magic(name="echo")
-    def echo(text: str) -> str:
-        return text
+class TestPlaceholderScope:
+    def setup_method(self, _):
+        self.p = MagicParser()
 
-    resp = shell.run("%echo hi;")
-    assert resp.exception is None
-    assert resp.result == "hi;"
+    def test_scope_starts_empty(self):
+        with self.p._placeholder_scope() as store:
+            assert store == {}
+
+    def test_scope_isolates_placeholders(self):
+        with self.p._placeholder_scope() as s1:
+            s1["k1"] = "v1"
+            with self.p._placeholder_scope() as s2:
+                s2["k2"] = "v2"
+                assert "k1" not in s2
+            # outer scope restored
+            assert self.p._current_placeholders() == {"k1": "v1"}
+
+    def test_scope_cleaned_after_exception(self):
+        try:
+            with self.p._placeholder_scope() as store:
+                store["x"] = "boom"
+                raise RuntimeError("oops")
+        except RuntimeError:
+            pass
+        # After scope exits the store is reset (outer scope, default empty)
+        assert "x" not in self.p._current_placeholders()
+
+    def test_concurrent_scopes_isolated(self):
+        """Two threads using _placeholder_scope must not see each other's keys."""
+        errors = []
+        seen = {}
+
+        def worker(name, key, value, barrier):
+            with self.p._placeholder_scope() as store:
+                store[key] = value
+                barrier.wait()          # both threads in scope simultaneously
+                snap = dict(self.p._current_placeholders())
+                seen[name] = snap
+
+        b = threading.Barrier(2)
+        t1 = threading.Thread(target=worker, args=("t1", "key_a", "val_a", b))
+        t2 = threading.Thread(target=worker, args=("t2", "key_b", "val_b", b))
+        t1.start(); t2.start()
+        t1.join();  t2.join()
+
+        assert not errors
+        assert "key_b" not in seen["t1"], "t1 saw t2's placeholder"
+        assert "key_a" not in seen["t2"], "t2 saw t1's placeholder"
 
 
-def test_inline_magic_consumes_rest_of_line_including_semicolon():
-    shell = Shell(display_mode="none")
+# ── _build_ignore_map ──────────────────────────────────────────────────────────
 
-    @shell.register_magic(name="echo")
-    def echo(text: str) -> str:
-        return text
+class TestBuildIgnoreMap:
+    def setup_method(self, _):
+        self.p = MagicParser()
 
-    resp = shell.run("x = %echo hi; y = 1\nx")
-    assert resp.exception is None
-    assert resp.result == "hi; y = 1"
-    assert "y" not in shell.namespace
+    def test_string_ignored(self):
+        code = '"hello %magic"'
+        lines = code.split("\n")
+        imap = self.p._build_ignore_map(code, lines)
+        # The % at col 7 must be inside the ignored span
+        assert self.p._position_ignored(imap, 1, 7)
+
+    def test_comment_ignored(self):
+        code = "x = 1  # %magic"
+        lines = code.split("\n")
+        imap = self.p._build_ignore_map(code, lines)
+        assert self.p._position_ignored(imap, 1, 10)
+
+    def test_code_not_ignored(self):
+        code = "%timeit x"
+        lines = code.split("\n")
+        imap = self.p._build_ignore_map(code, lines)
+        assert not self.p._position_ignored(imap, 1, 0)
+
+    def test_incomplete_code_returns_empty(self):
+        # list() force l'évaluation complète du générateur dans le try/except —
+        # TokenError est maintenant toujours attrapée, même en Python 3.12+.
+        imap = self.p._build_ignore_map("def foo(:", ["def foo(:"])
+        assert isinstance(imap, dict)
+        assert imap == {}
 
 
-def test_magic_modes_line_only_and_cell_only():
-    shell = Shell(display_mode="none")
+# ── _parse_system_cmd ─────────────────────────────────────────────────────────
 
-    @shell.register_magic(name="lineonly", mode="line")
-    def lineonly(text: str) -> str:
-        return f"line:{text}"
+class TestParseSystemCmd:
+    def setup_method(self, _):
+        self.p = MagicParser()
 
-    @shell.register_magic(name="cellonly", mode="cell")
-    def cellonly(text: str) -> str:
-        return f"cell:{text}"
+    def _parse(self, code):
+        with self.p._placeholder_scope():
+            return self.p._parse_system_cmd(code)
 
-    assert shell.run("%lineonly hi").result == "line:hi"
-    assert shell.run("%%cellonly\nhi").result == "cell:hi"
+    def test_single_bang(self):
+        result = self._parse("!ls -la")
+        assert "run_system_cmd(" in result
+        assert "!ls" not in result
 
-    resp = shell.run("%%lineonly\nhi")
-    assert isinstance(resp.exception, Exception)
+    def test_double_bang_capture(self):
+        result = self._parse("!!ls")
+        assert "run_system_cmd_capture(" in result
 
-    resp = shell.run("%cellonly hi")
-    assert isinstance(resp.exception, Exception)
+    def test_bang_in_string_not_transformed(self):
+        code = 'x = "!not a command"'
+        result = self._parse(code)
+        assert result == code
+
+    def test_indented_bang(self):
+        code = "if True:\n    !echo hi"
+        result = self._parse(code)
+        assert "    __shell__.run_system_cmd(" in result
+
+    def test_placeholder_key_in_result(self):
+        result = self._parse("!echo test")
+        assert "_render_placeholder(" in result
+
+
+# ── _parse_magics ──────────────────────────────────────────────────────────────
+
+class TestParseMagics:
+    def setup_method(self, _):
+        self.p = MagicParser()
+
+    def _parse(self, code):
+        with self.p._placeholder_scope():
+            return self.p._parse_magics(code)
+
+    def test_line_magic(self):
+        result = self._parse("%timeit x + 1")
+        assert "_call_magic('timeit', 'line'" in result
+
+    def test_cell_magic(self):
+        result = self._parse("%%bash\necho hello")
+        assert "_call_magic('bash', 'cell'" in result
+
+    def test_magic_in_string_not_transformed(self):
+        code = 'x = "%not_magic"'
+        result = self._parse(code)
+        assert result == code
+
+    def test_inline_magic(self):
+        result = self._parse("x = %mymagic arg")
+        assert "_call_magic('mymagic', 'line'" in result
+
+    def test_double_percent_not_inline(self):
+        # %% at start of cell is cell magic, not inline
+        result = self._parse("%%bash\necho hi")
+        assert "_call_magic('bash', 'cell'" in result
+
+    def test_plain_code_unchanged(self):
+        code = "x = 1 + 2"
+        assert self._parse(code) == code

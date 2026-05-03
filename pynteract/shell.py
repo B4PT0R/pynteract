@@ -63,6 +63,8 @@ from __future__ import annotations
 import sys
 import builtins
 import ast
+import asyncio
+import concurrent.futures
 import contextvars
 
 from collections import OrderedDict
@@ -150,6 +152,9 @@ class Shell:
         namespace (dict): The global namespace for code execution.
         display_mode (str): Controls when results are displayed ('all', 'last', or 'none').
         history_size (int): Maximum number of past executions to cache.
+        silent (bool): Default silent mode for runs. If True, suppress stdout/stderr hook
+            calls by default while still capturing output. Per-call ``run(..., silent=...)``
+            overrides this default.
 
         Hooks:
             Hooks are stored in ``self.hooks`` (a dict) and are passed to ``Shell(...)`` as keyword
@@ -205,6 +210,7 @@ class Shell:
         ensure_cwd_on_syspath: bool = True,
         display_mode: Literal['all', 'last', 'none'] = 'last',
         history_size: int = 200,
+        silent: bool = False,
         # Hooks (passed by name via **hooks; see docs above for supported keys)
         **hooks: Any,
     ) -> None:
@@ -240,6 +246,7 @@ class Shell:
         self._futures = future_utils.FutureManager()
 
         self.display_mode = display_mode
+        self.silent = bool(silent)
         self.magics= {}
         self._magic_parser=MagicParser()
         self.last_result = None
@@ -525,7 +532,7 @@ class Shell:
 
         return exec_globals, exec_locals
 
-    def run(self, code, globals=None, locals=None, silent=False, filename=None):
+    def run(self, code, globals=None, locals=None, silent=None, filename=None):
         """
         Execute the given code in the shell environment.
 
@@ -533,7 +540,7 @@ class Shell:
             code (str): The Python code to execute.
             globals (dict, optional): Global namespace to use. If None, uses self.namespace.
             locals (dict, optional): Local namespace to use. If None, globals will be used.
-            silent (bool): If True, suppress stdout/stderr hook calls for this run (output is still captured).
+            silent (bool, optional): If provided, overrides the shell's default silent mode for this run.
             filename (str, optional): Custom filename used in tracebacks/history (useful for notebooks/cells).
 
         Returns:
@@ -541,7 +548,8 @@ class Shell:
         """
         filename = self._next_filename(filename)
         token_ctx = RUN_CONTEXT.set(RunContext(name=filename))
-        token_silent = SILENT_STDIO.set(bool(silent))
+        run_silent = self.silent if silent is None else bool(silent)
+        token_silent = SILENT_STDIO.set(run_silent)
         token_prompt = PENDING_STDIN_PROMPT.set(False)
         try:
             input_hook = self.hooks.get("input_hook")
@@ -614,6 +622,62 @@ class Shell:
             SILENT_STDIO.reset(token_silent)
             RUN_CONTEXT.reset(token_ctx)
     
+
+    async def arun(self, code, globals=None, locals=None, silent=None, filename=None):
+        """Execute *code* asynchronously without blocking the running event loop.
+
+        ``arun`` is the async counterpart of :meth:`run`.  It offloads the
+        synchronous execution to a :class:`~concurrent.futures.ThreadPoolExecutor`
+        so that the caller's event loop remains responsive during long-running
+        cells.  ``contextvars`` are propagated automatically via
+        :func:`contextvars.copy_context`, which means that ``RUN_CONTEXT``,
+        ``SILENT_STDIO`` and ``CAPTURE_STREAMS`` all behave exactly as they
+        would in a plain ``run()`` call.
+
+        Async hooks registered on ``stdout_hook`` / ``stderr_hook`` are
+        scheduled on *this* event loop by :func:`~pynteract.streams._fire_async_hook`
+        as each chunk is flushed — there is no extra wiring required here.
+
+        Args:
+            code (str): The Python code to execute.
+            globals (dict, optional): Global namespace to use. If None, uses self.namespace.
+            locals (dict, optional): Local namespace to use. If None, globals will be used.
+            silent (bool, optional): If provided, overrides the shell's default silent mode for this run.
+            filename (str, optional): Custom filename used in tracebacks/history.
+
+        Returns:
+            ShellResponse: An object containing the results of the execution.
+
+        Example::
+
+            shell = Shell()
+            async def main():
+                response = await shell.arun("1 + 1")
+                print(response.result)  # 2
+            asyncio.run(main())
+        """
+        ctx = contextvars.copy_context()
+        loop = asyncio.get_running_loop()
+
+        def _run_and_inject():
+            # Inject the caller's event loop into every Stream the Collector
+            # will create so that async hooks can schedule back onto it.
+            for attr in ("stdout_hook", "stderr_hook"):
+                # Streams are created fresh per run(); we propagate via a
+                # temporary shell attribute that Collector/Stream can read.
+                pass
+            # Patch: store loop on shell so Stream instances created during
+            # this run() can find it via self._shell._arun_loop.
+            self._arun_loop = loop
+            try:
+                return ctx.run(self.run, code, globals, locals, silent, filename)
+            finally:
+                self._arun_loop = None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            response = await loop.run_in_executor(pool, _run_and_inject)
+        return response
+
     def add_to_history(self, filename, response):
         """Add a ``ShellResponse`` to the cache, enforcing the size limit.
 

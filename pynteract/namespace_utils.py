@@ -3,6 +3,7 @@ from __future__ import annotations
 import builtins as _builtins
 import sys
 import uuid
+import threading
 from typing import Any
 
 
@@ -75,6 +76,18 @@ class NamespaceManager:
     module-like object in ``sys.modules`` whose ``__dict__`` is that same dict
     (reference preserved), enabling module-level expectations like ``__name__``
     and ``__file__`` plus import-related behaviours.
+
+    Thread safety
+    -------------
+    ``reset_module_namespace()`` and ``set_namespace()`` mutate shared state
+    (the namespace dict and ``sys.modules``).  Both are protected by an
+    instance-level ``threading.Lock`` so that concurrent ``arun()`` calls on
+    the same shell cannot observe a half-reset namespace.
+
+    Note: individual *reads* of ``self.namespace`` are not locked because dict
+    reads are atomic in CPython and the common case (parallel arun on the same
+    shell) shares the namespace intentionally.  Only structural mutations
+    (clear + re-populate, swap) are locked.
     """
 
     def __init__(
@@ -88,6 +101,7 @@ class NamespaceManager:
         if ensure_cwd_on_syspath:
             _ensure_cwd_on_syspath()
 
+        self._lock = threading.Lock()
         self.namespace: dict[str, Any] = {} if namespace is None else namespace
         self.module_name = _choose_module_name(self.namespace, preferred=module_name)
         self.current_filename = filename
@@ -127,16 +141,34 @@ class NamespaceManager:
         self.namespace["__file__"] = filename
 
     def reset_module_namespace(self) -> None:
-        """Clear namespace (preserve module identity keys)."""
-        self.namespace.clear()
-        _ensure_identity_keys(self.namespace, module_name=self.module_name, filename=self.current_filename)
-        self.module = _ensure_module(
-            self.module_name, namespace=self.namespace, filename=self.current_filename
-        )
+        """Clear namespace atomically (preserve module identity keys).
+
+        Protected by ``self._lock`` to prevent concurrent ``arun()`` calls
+        from observing the namespace mid-clear.
+        """
+        with self._lock:
+            self.namespace.clear()
+            _ensure_identity_keys(
+                self.namespace,
+                module_name=self.module_name,
+                filename=self.current_filename,
+            )
+            self.module = _ensure_module(
+                self.module_name,
+                namespace=self.namespace,
+                filename=self.current_filename,
+            )
 
     def set_namespace(self, namespace: dict[str, Any]) -> None:
-        """Replace the namespace dict (reference preserved)."""
-        self.namespace = namespace
-        self.module = _ensure_module(
-            self.module_name, namespace=self.namespace, filename=self.current_filename
-        )
+        """Replace the namespace dict atomically (reference preserved).
+
+        Protected by ``self._lock`` to prevent a concurrent ``arun()`` from
+        executing against the old namespace after the swap.
+        """
+        with self._lock:
+            self.namespace = namespace
+            self.module = _ensure_module(
+                self.module_name,
+                namespace=self.namespace,
+                filename=self.current_filename,
+            )

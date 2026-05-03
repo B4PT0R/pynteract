@@ -1,9 +1,22 @@
 import sys
-from pathlib import Path
+import os
+
+# Ensure the local dev copy is imported, not the installed package
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+import pytest
+from pynteract import Shell
 
 
-# Ensure the repository root is importable when running tests without installation.
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+@pytest.fixture
+def shell():
+    """Fresh Shell instance for each test."""
+    return Shell()
 
+
+@pytest.fixture
+def stateful_shell():
+    """Shell with pre-seeded namespace (x=42) for state-persistence tests."""
+    s = Shell()
+    s.run("x = 42")
+    return s
