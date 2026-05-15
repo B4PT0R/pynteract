@@ -281,7 +281,7 @@ Key methods:
 
 | Method | Signature | Notes |
 | --- | --- | --- |
-| Execute | `run(code, globals=None, locals=None, silent=None, filename=None) -> ShellResponse` | `silent=True` suppresses stdout/stderr hooks for one run; `None` uses the instance default. |
+| Execute | `run(code, globals=None, locals=None, silent=None, filename=None, cwd=None) -> ShellResponse` | `cwd` selects the run working directory; the shell keeps its own cwd and restores the caller process cwd. |
 | Interactive | `interact() -> int` | Terminal REPL; returns process-like exit code. |
 | Restart | `restart_session(rerun_startup=True, announce=True) -> int` | Resets namespace and (optionally) reruns startup. |
 | Namespace | `update_namespace(**kwargs)` | Adds symbols to the execution namespace. |
@@ -300,6 +300,7 @@ Important public attributes:
 | `hooks` | `dict[str, Any]` | Hook registry; updated dynamically. |
 | `magics` | `dict[str, Any]` | Registered magics. |
 | `history` | `OrderedDict[str, ShellResponse]` | Recent run history keyed by filename. |
+| `cwd` | `str` | Shell-local working directory used by `run()`/`arun()` and updated after in-run `os.chdir()`/`%cd`. |
 | `last_result` | `Any` | Last expression value. |
 | `silent` | `bool` | Instance default for suppressing stdout/stderr hooks while still capturing output. |
 

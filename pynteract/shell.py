@@ -66,6 +66,7 @@ import ast
 import asyncio
 import concurrent.futures
 import contextvars
+import os
 
 from collections import OrderedDict
 from asttokens import ASTTokens
@@ -256,6 +257,7 @@ class Shell:
         self.history=OrderedDict()
         self._input_counter=0
         self.session=None
+        self.cwd = os.path.abspath(os.getcwd())
         self.ensure_builtins()
         self._startup_ran = False
         self._startup_announced = False
@@ -374,6 +376,17 @@ class Shell:
             raise ValueError(f"Magic %%{name} does not support cell mode")
 
         return magic(text)
+
+    def _normalize_cwd(self, cwd: str | os.PathLike[str] | None) -> str:
+        if cwd is None:
+            cwd = self.cwd
+        return os.path.abspath(os.path.expanduser(os.path.expandvars(os.fspath(cwd))))
+
+    def _finalize_cwd(self, fallback: str) -> None:
+        try:
+            self.cwd = os.path.abspath(os.getcwd())
+        except OSError:
+            self.cwd = fallback
 
     def run_system_cmd(self, command):
         """Runs a system command using subprocess.
@@ -532,7 +545,7 @@ class Shell:
 
         return exec_globals, exec_locals
 
-    def run(self, code, globals=None, locals=None, silent=None, filename=None):
+    def run(self, code, globals=None, locals=None, silent=None, filename=None, cwd=None):
         """
         Execute the given code in the shell environment.
 
@@ -542,10 +555,16 @@ class Shell:
             locals (dict, optional): Local namespace to use. If None, globals will be used.
             silent (bool, optional): If provided, overrides the shell's default silent mode for this run.
             filename (str, optional): Custom filename used in tracebacks/history (useful for notebooks/cells).
+            cwd (str or os.PathLike, optional): Working directory for this run. If omitted, uses
+                the shell's internal ``cwd``. The final process cwd after user code runs is saved
+                back to ``self.cwd`` and the caller's process cwd is restored.
 
         Returns:
             ShellResponse: An object containing the results of the execution.
         """
+        previous_process_cwd = os.path.abspath(os.getcwd())
+        run_cwd = self._normalize_cwd(cwd)
+        os.chdir(run_cwd)
         filename = self._next_filename(filename)
         token_ctx = RUN_CONTEXT.set(RunContext(name=filename))
         run_silent = self.silent if silent is None else bool(silent)
@@ -618,12 +637,14 @@ class Shell:
                 self.add_to_history(filename, response)
                 return response
         finally:
+            self._finalize_cwd(run_cwd)
+            os.chdir(previous_process_cwd)
             PENDING_STDIN_PROMPT.reset(token_prompt)
             SILENT_STDIO.reset(token_silent)
             RUN_CONTEXT.reset(token_ctx)
     
 
-    async def arun(self, code, globals=None, locals=None, silent=None, filename=None):
+    async def arun(self, code, globals=None, locals=None, silent=None, filename=None, cwd=None):
         """Execute *code* asynchronously without blocking the running event loop.
 
         ``arun`` is the async counterpart of :meth:`run`.  It offloads the
@@ -644,6 +665,8 @@ class Shell:
             locals (dict, optional): Local namespace to use. If None, globals will be used.
             silent (bool, optional): If provided, overrides the shell's default silent mode for this run.
             filename (str, optional): Custom filename used in tracebacks/history.
+            cwd (str or os.PathLike, optional): Working directory for this run. If omitted, uses
+                the shell's internal ``cwd``.
 
         Returns:
             ShellResponse: An object containing the results of the execution.
@@ -670,7 +693,7 @@ class Shell:
             # this run() can find it via self._shell._arun_loop.
             self._arun_loop = loop
             try:
-                return ctx.run(self.run, code, globals, locals, silent, filename)
+                return ctx.run(self.run, code, globals, locals, silent, filename, cwd)
             finally:
                 self._arun_loop = None
 
