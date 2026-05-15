@@ -156,6 +156,9 @@ class Shell:
         silent (bool): Default silent mode for runs. If True, suppress stdout/stderr hook
             calls by default while still capturing output. Per-call ``run(..., silent=...)``
             overrides this default.
+        use_internal_cwd (bool): If True (default), keep a shell-local working
+            directory and restore the caller process cwd after each run. If False,
+            use and mutate the ambient process cwd directly.
 
         Hooks:
             Hooks are stored in ``self.hooks`` (a dict) and are passed to ``Shell(...)`` as keyword
@@ -212,6 +215,7 @@ class Shell:
         display_mode: Literal['all', 'last', 'none'] = 'last',
         history_size: int = 200,
         silent: bool = False,
+        use_internal_cwd: bool = True,
         # Hooks (passed by name via **hooks; see docs above for supported keys)
         **hooks: Any,
     ) -> None:
@@ -248,6 +252,7 @@ class Shell:
 
         self.display_mode = display_mode
         self.silent = bool(silent)
+        self.use_internal_cwd = bool(use_internal_cwd)
         self.magics= {}
         self._magic_parser=MagicParser()
         self.last_result = None
@@ -257,7 +262,7 @@ class Shell:
         self.history=OrderedDict()
         self._input_counter=0
         self.session=None
-        self.cwd = os.path.abspath(os.getcwd())
+        self._cwd = os.path.abspath(os.getcwd())
         self.ensure_builtins()
         self._startup_ran = False
         self._startup_announced = False
@@ -322,6 +327,25 @@ class Shell:
     def namespace(self) -> dict[str, Any]:
         """Module-backed execution namespace (canonical)."""
         return self._ns.namespace
+
+    @property
+    def cwd(self) -> str:
+        """Current shell working directory.
+
+        In internal-cwd mode this is shell-local state. In ambient-cwd mode it
+        reflects the hosting process cwd directly.
+        """
+        if self.use_internal_cwd:
+            return self._cwd
+        return os.path.abspath(os.getcwd())
+
+    @cwd.setter
+    def cwd(self, value: str | os.PathLike[str]) -> None:
+        normalized = os.path.abspath(os.path.expanduser(os.path.expandvars(os.fspath(value))))
+        if self.use_internal_cwd:
+            self._cwd = normalized
+        else:
+            os.chdir(normalized)
 
     @property
     def current_code(self):
@@ -555,16 +579,18 @@ class Shell:
             locals (dict, optional): Local namespace to use. If None, globals will be used.
             silent (bool, optional): If provided, overrides the shell's default silent mode for this run.
             filename (str, optional): Custom filename used in tracebacks/history (useful for notebooks/cells).
-            cwd (str or os.PathLike, optional): Working directory for this run. If omitted, uses
-                the shell's internal ``cwd``. The final process cwd after user code runs is saved
-                back to ``self.cwd`` and the caller's process cwd is restored.
+            cwd (str or os.PathLike, optional): Working directory for this run. In
+                internal-cwd mode, the final cwd after user code runs is saved back to
+                ``self.cwd`` and the caller process cwd is restored. In ambient-cwd
+                mode, the process cwd is left wherever the run/user code ended.
 
         Returns:
             ShellResponse: An object containing the results of the execution.
         """
         previous_process_cwd = os.path.abspath(os.getcwd())
         run_cwd = self._normalize_cwd(cwd)
-        os.chdir(run_cwd)
+        if self.use_internal_cwd or cwd is not None:
+            os.chdir(run_cwd)
         filename = self._next_filename(filename)
         token_ctx = RUN_CONTEXT.set(RunContext(name=filename))
         run_silent = self.silent if silent is None else bool(silent)
@@ -637,8 +663,9 @@ class Shell:
                 self.add_to_history(filename, response)
                 return response
         finally:
-            self._finalize_cwd(run_cwd)
-            os.chdir(previous_process_cwd)
+            if self.use_internal_cwd:
+                self._finalize_cwd(run_cwd)
+                os.chdir(previous_process_cwd)
             PENDING_STDIN_PROMPT.reset(token_prompt)
             SILENT_STDIO.reset(token_silent)
             RUN_CONTEXT.reset(token_ctx)
@@ -665,8 +692,8 @@ class Shell:
             locals (dict, optional): Local namespace to use. If None, globals will be used.
             silent (bool, optional): If provided, overrides the shell's default silent mode for this run.
             filename (str, optional): Custom filename used in tracebacks/history.
-            cwd (str or os.PathLike, optional): Working directory for this run. If omitted, uses
-                the shell's internal ``cwd``.
+            cwd (str or os.PathLike, optional): Working directory for this run; follows
+                the same internal-vs-ambient cwd semantics as ``run()``.
 
         Returns:
             ShellResponse: An object containing the results of the execution.

@@ -98,6 +98,12 @@ This filename is used for:
 `Shell.history` is an `OrderedDict` of recent `ShellResponse` objects keyed by synthetic/custom filename.
 The size is capped by `history_size`.
 
+### Working directory modes
+
+By default, `Shell(use_internal_cwd=True)` keeps a shell-local cwd. `run(..., cwd=...)`, `%cd`, or `os.chdir()` inside user code update `shell.cwd`, while the caller process cwd is restored after each run.
+
+For embedders that intentionally want Python execution to share and mutate the host process cwd, use `Shell(use_internal_cwd=False)`. In that mode, `shell.cwd` reflects `os.getcwd()`, and a run leaves the process cwd wherever user code ended.
+
 ## Magics and system commands
 
 ### Registering magics
@@ -273,6 +279,7 @@ Shell(
     display_mode: Literal["all", "last", "none"] = "last",
     history_size: int = 200,
     silent: bool = False,
+    use_internal_cwd: bool = True,
     **hooks,
 )
 ```
@@ -281,7 +288,7 @@ Key methods:
 
 | Method | Signature | Notes |
 | --- | --- | --- |
-| Execute | `run(code, globals=None, locals=None, silent=None, filename=None, cwd=None) -> ShellResponse` | `cwd` selects the run working directory; the shell keeps its own cwd and restores the caller process cwd. |
+| Execute | `run(code, globals=None, locals=None, silent=None, filename=None, cwd=None) -> ShellResponse` | `cwd` selects the run working directory. With `use_internal_cwd=True` (default), the shell keeps its own cwd and restores the caller process cwd; with `False`, runs use/mutate the ambient process cwd. |
 | Interactive | `interact() -> int` | Terminal REPL; returns process-like exit code. |
 | Restart | `restart_session(rerun_startup=True, announce=True) -> int` | Resets namespace and (optionally) reruns startup. |
 | Namespace | `update_namespace(**kwargs)` | Adds symbols to the execution namespace. |
@@ -300,7 +307,7 @@ Important public attributes:
 | `hooks` | `dict[str, Any]` | Hook registry; updated dynamically. |
 | `magics` | `dict[str, Any]` | Registered magics. |
 | `history` | `OrderedDict[str, ShellResponse]` | Recent run history keyed by filename. |
-| `cwd` | `str` | Shell-local working directory used by `run()`/`arun()` and updated after in-run `os.chdir()`/`%cd`. |
+| `cwd` | `str` | Current working directory used by `run()`/`arun()`: shell-local in internal-cwd mode, process cwd in ambient mode. |
 | `last_result` | `Any` | Last expression value. |
 | `silent` | `bool` | Instance default for suppressing stdout/stderr hooks while still capturing output. |
 
