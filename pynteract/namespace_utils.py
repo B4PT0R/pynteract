@@ -4,6 +4,7 @@ import builtins as _builtins
 import sys
 import uuid
 import threading
+from weakref import WeakKeyDictionary
 from typing import Any
 
 
@@ -69,6 +70,10 @@ def _choose_module_name(
             return candidate
 
 
+_MISSING = object()
+_released_modules = WeakKeyDictionary()
+
+
 class NamespaceManager:
     """Manage a single dict execution namespace registered in ``sys.modules``.
 
@@ -77,17 +82,9 @@ class NamespaceManager:
     (reference preserved), enabling module-level expectations like ``__name__``
     and ``__file__`` plus import-related behaviours.
 
-    Thread safety
-    -------------
-    ``reset_module_namespace()`` and ``set_namespace()`` mutate shared state
-    (the namespace dict and ``sys.modules``).  Both are protected by an
-    instance-level ``threading.Lock`` so that concurrent ``arun()`` calls on
-    the same shell cannot observe a half-reset namespace.
-
-    Note: individual *reads* of ``self.namespace`` are not locked because dict
-    reads are atomic in CPython and the common case (parallel arun on the same
-    shell) shares the namespace intentionally.  Only structural mutations
-    (clear + re-populate, swap) are locked.
+    Registrations installed by this manager are released explicitly by ``close``.
+    Existing modules backed by the same dict remain caller-owned. Structural
+    namespace mutations are serialized; Shell also guards execution ownership.
     """
 
     def __init__(
@@ -102,10 +99,41 @@ class NamespaceManager:
             _ensure_cwd_on_syspath()
 
         self._lock = threading.Lock()
+        self._registrations = {}
         self.namespace: dict[str, Any] = {} if namespace is None else namespace
         self.module_name = _choose_module_name(self.namespace, preferred=module_name)
         self.current_filename = filename
-        self.module = _ensure_module(self.module_name, namespace=self.namespace, filename=filename)
+        self.module = self.bind_namespace(self.namespace, filename=filename, module_name=self.module_name)
+
+    def bind_namespace(self, namespace, *, filename, module_name=None):
+        """Register a namespace, retaining only registrations we actually install."""
+        name = _choose_module_name(namespace, preferred=module_name)
+        previous = sys.modules.get(name, _MISSING)
+        module = _ensure_module(name, namespace=namespace, filename=filename)
+        if module is not previous:
+            original, owned = self._registrations.get(name, (previous, None))
+            if owned is not None:
+                _released_modules[owned] = original
+            if previous is not owned:
+                original = previous
+            self._registrations[name] = (original, module)
+        return module
+
+    def close(self):
+        """Restore only slots that still contain our exact module object."""
+        with self._lock:
+            for name, (original, owned) in self._registrations.items():
+                # A later shell may have temporarily replaced our registration.
+                # Its eventual close must not resurrect this already closed one.
+                _released_modules[owned] = original
+                while isinstance(original, DummyModule) and original in _released_modules:
+                    original = _released_modules[original]
+                if sys.modules.get(name, _MISSING) is owned:
+                    if original is _MISSING:
+                        sys.modules.pop(name, None)
+                    else:
+                        sys.modules[name] = original
+            self._registrations.clear()
 
     @staticmethod
     def prepare_namespace(
@@ -153,9 +181,9 @@ class NamespaceManager:
                 module_name=self.module_name,
                 filename=self.current_filename,
             )
-            self.module = _ensure_module(
-                self.module_name,
-                namespace=self.namespace,
+            self.module = self.bind_namespace(
+                self.namespace,
+                module_name=self.module_name,
                 filename=self.current_filename,
             )
 
@@ -167,8 +195,8 @@ class NamespaceManager:
         """
         with self._lock:
             self.namespace = namespace
-            self.module = _ensure_module(
-                self.module_name,
-                namespace=self.namespace,
+            self.module = self.bind_namespace(
+                self.namespace,
+                module_name=self.module_name,
                 filename=self.current_filename,
             )

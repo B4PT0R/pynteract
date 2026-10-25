@@ -3,14 +3,13 @@ Tests de non-régression pour la couche async :
   - Shell.arun()
   - Collector async (async with)
   - Stream : hooks async
-  - _fire_async_hook
 """
 import asyncio
 import sys
 import pytest
 from pynteract import Shell
 from pynteract.collector import Collector
-from pynteract.streams import Stream, _fire_async_hook
+from pynteract.streams import Stream
 
 
 # ── Shell.arun() ───────────────────────────────────────────────────────────────
@@ -72,41 +71,31 @@ class TestArun:
         assert r1.result == 1
         assert r2.result == 2
 
-    async def test_event_loop_not_blocked(self, shell):
-        """arun must not block the event loop — a concurrent task should progress."""
-        ticks = []
-
-        async def ticker():
-            for _ in range(3):
-                await asyncio.sleep(0)
-                ticks.append(1)
-
-        await asyncio.gather(
-            shell.arun("import time; time.sleep(0.05)"),
-            ticker(),
-        )
-        assert len(ticks) == 3
+    async def test_top_level_await_yields_to_caller_loop(self, shell):
+        entered, release = asyncio.Event(), asyncio.Event()
+        shell.update_namespace(entered=entered, release=release)
+        task = asyncio.create_task(shell.arun("entered.set()\nawait release.wait()\n42"))
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        assert not task.done()
+        release.set()
+        response = await task
+        assert response.exception is None
+        assert response.result == 42
 
     async def test_contextvars_propagated(self, shell):
-        """copy_context() dans arun() doit propager les contextvars de l'appelant au thread."""
+        """Read the actual caller ContextVar from inside executed code."""
         import contextvars
-        _VAR = contextvars.ContextVar("_test_var", default=None)
-        _VAR.set("propagated!")
-        # On injecte la var dans le namespace du shell pour pouvoir la lire depuis le code
-        shell.run(f"import contextvars; _VAR = contextvars.ContextVar('_test_var', default=None)")
-        r = await shell.arun("_VAR.get()")
-        # La var dans le thread a son propre contexte — elle vaut None (default)
-        # car set() au-dessus ne traverse pas copy_context vers le namespace shell.
-        # Ce qu'on vérifie : arun() ne lève pas et retourne un résultat cohérent.
-        assert r.exception is None
-        # Vérification positive : une var settée AVANT copy_context est visible dans le thread.
-        import contextvars
-        _OUTER = contextvars.ContextVar("_outer", default="missing")
-        _OUTER.set("hello_from_outer")
-        # On passe la valeur via le namespace plutôt que via contextvars (plus fiable en test)
-        shell.namespace["_expected"] = _OUTER.get()
-        r2 = await shell.arun("_expected")
-        assert r2.result == "hello_from_outer"
+
+        var = contextvars.ContextVar("caller_value", default="missing")
+        token = var.set("propagated")
+        shell.update_namespace(var=var)
+        try:
+            response = await shell.arun("var.get()")
+            assert response.exception is None
+            assert response.result == "propagated"
+            assert var.get() == "propagated"
+        finally:
+            var.reset(token)
 
 
 # ── Async stdout hook ──────────────────────────────────────────────────────────
@@ -115,41 +104,37 @@ class TestAsyncHooks:
     async def test_async_stdout_hook_called(self, shell):
         received = []
 
-        async def async_hook(data, buf, ctx):
+        async def async_hook(data, buf):
             received.append(data)
 
         shell.hooks["stdout_hook"] = async_hook
         await shell.arun("print('from async hook')")
-        # Give scheduled tasks a chance to run
-        await asyncio.sleep(0)
         assert any("from async hook" in chunk for chunk in received)
 
     async def test_async_stderr_hook_called(self, shell):
         received = []
 
-        async def async_hook(data, buf, ctx):
+        async def async_hook(data, buf):
             received.append(data)
 
         shell.hooks["stderr_hook"] = async_hook
         await shell.arun("import sys; sys.stderr.write('async err\\n')")
-        await asyncio.sleep(0)
         assert any("async err" in chunk for chunk in received)
 
     async def test_sync_hook_still_works_in_arun(self, shell):
         received = []
-        shell.hooks["stdout_hook"] = lambda data, buf, ctx: received.append(data)
+        shell.hooks["stdout_hook"] = lambda data, buf: received.append(data)
         await shell.arun("print('sync in async')")
         assert any("sync in async" in chunk for chunk in received)
 
     async def test_async_hook_receives_cumulative_buffer(self, shell):
         buffers = []
 
-        async def hook(data, buf, ctx):
+        async def hook(data, buf):
             buffers.append(buf)
 
         shell.hooks["stdout_hook"] = hook
         await shell.arun("print('line1')\nprint('line2')")
-        await asyncio.sleep(0)
         assert len(buffers) >= 2
         # Buffer must grow monotonically
         assert all(
@@ -203,52 +188,3 @@ class TestAsyncCollector:
         async_out = c_async.get_stdout()
 
         assert sync_out == async_out
-
-
-# ── _fire_async_hook ───────────────────────────────────────────────────────────
-
-class TestFireAsyncHook:
-    async def test_schedules_coroutine(self):
-        ran = []
-
-        async def coro():
-            ran.append(True)
-
-        _fire_async_hook(coro())
-        await asyncio.sleep(0)
-        assert ran == [True]
-
-    async def test_multiple_hooks_all_run(self):
-        results = []
-
-        async def make_coro(v):
-            results.append(v)
-
-        for i in range(5):
-            _fire_async_hook(make_coro(i))
-        await asyncio.sleep(0)
-        assert sorted(results) == [0, 1, 2, 3, 4]
-
-    def test_warns_without_event_loop(self):
-        """Outside any loop, _fire_async_hook must warn and close the coro cleanly."""
-        import warnings
-
-        async def dummy():
-            pass  # pragma: no cover
-
-        # Make sure we're outside a running loop
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                pytest.skip("Cannot test no-loop path inside a running loop")
-            loop.close()
-        except RuntimeError:
-            pass
-
-        asyncio.set_event_loop(None)
-
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            _fire_async_hook(dummy())
-
-        assert any(issubclass(warning.category, RuntimeWarning) for warning in w)

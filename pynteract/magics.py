@@ -19,8 +19,8 @@ _PLACEHOLDER_STORE: contextvars.ContextVar[dict[str, str]] = contextvars.Context
 )
 
 # Built-ins that are explicitly allowed in magic template expressions.
-# Everything else is blocked to prevent arbitrary code injection via
-# template strings like `{__import__('os').system('rm -rf /')}`.
+# This limits convenience names, not capabilities: user objects and Python
+# introspection remain accessible. Templates require trusted input.
 _TEMPLATE_SAFE_BUILTINS: dict[str, Any] = {
     "abs": abs, "all": all, "any": any, "bin": bin, "bool": bool,
     "bytes": bytes, "chr": chr, "dict": dict, "dir": dir, "divmod": divmod,
@@ -87,30 +87,21 @@ class MagicParser:
             self._placeholders = _PLACEHOLDER_STORE.get()
 
     # ------------------------------------------------------------------
-    # Template rendering — restricted eval
+    # Template rendering — trusted expressions
     # ------------------------------------------------------------------
 
     @staticmethod
     def _render_template(text: str, globals_dict: dict, locals_dict: dict) -> str:
-        """IPython-style template expansion with a restricted eval sandbox.
+        """Expand trusted Python expressions, with ``{{`` / ``}}`` escapes.
 
-        - ``{expr}`` is evaluated and substituted with ``str(value)``.
-        - ``{{`` and ``}}`` escape literal braces.
-
-        The eval sandbox merges ``globals_dict`` and ``locals_dict`` as usual,
-        but overrides ``__builtins__`` with a curated whitelist
-        (:data:`_TEMPLATE_SAFE_BUILTINS`) so that dangerous calls like
-        ``{__import__('os').system('rm -rf /')}`` are blocked with a
-        ``NameError`` rather than silently executed.
-
-        Note: the user's own namespace variables (globals_dict / locals_dict)
-        are still fully accessible — only the *built-in* surface is restricted.
+        Builtins are curated, but namespace objects remain fully accessible.
+        This is not a sandbox and must never evaluate untrusted input.
         """
         out: list[str] = []
         i = 0
         n = len(text)
 
-        # Build a safe globals that restricts builtins but preserves user vars.
+        # Restrict builtin names, without restricting user objects or capabilities.
         safe_globals = dict(globals_dict)
         safe_globals["__builtins__"] = _TEMPLATE_SAFE_BUILTINS
 
@@ -121,9 +112,7 @@ class MagicParser:
                     out.append("{")
                     i += 2
                     continue
-                j = text.find("}", i + 1)
-                if j == -1:
-                    raise ValueError("Unmatched '{' in template")
+                j = MagicParser._template_end(text, i + 1)
                 expr = text[i + 1 : j].strip()
                 if not expr:
                     raise ValueError("Empty '{}' template expression")
@@ -140,6 +129,27 @@ class MagicParser:
             out.append(ch)
             i += 1
         return "".join(out)
+
+    @staticmethod
+    def _template_end(text: str, start: int) -> int:
+        """Find the outer closing brace using Python's own string tokenizer."""
+        source = text[start:]
+        lines = source.splitlines(keepends=True)
+        depth = 0
+        try:
+            for token in tokenize.generate_tokens(io.StringIO(source).readline):
+                if token.type != tokenize.OP:
+                    continue
+                if token.string == "{":
+                    depth += 1
+                elif token.string == "}":
+                    if depth == 0:
+                        row, column = token.start
+                        return start + sum(map(len, lines[:row - 1])) + column
+                    depth -= 1
+        except (tokenize.TokenError, IndentationError):
+            pass
+        raise ValueError("Unmatched '{' in template")
 
     def _render_placeholder(self, key: str, globals_dict: dict, locals_dict: dict) -> str:
         raw = self._current_placeholders().get(key, "")
@@ -177,6 +187,8 @@ class MagicParser:
         """Transform shell-escape syntax (``!cmd``, ``!!cmd``) into __shell__ calls."""
         store = self._current_placeholders()
         stripped_code = code.lstrip("\n")
+        if stripped_code.startswith("%%"):
+            return code
         if stripped_code.startswith("!!"):
             command = stripped_code[2:].lstrip("\n")
             pid = short_id()
@@ -228,7 +240,7 @@ class MagicParser:
                 if self._position_ignored(ignore_map, i + 1, column):
                     continue
                 indent = line[:column]
-                parts = stripped.split(" ", 1)
+                parts = stripped.split(None, 1)
                 magic = parts[0][1:]
                 content = parts[1].strip() if len(parts) > 1 else ""
                 pid = short_id()

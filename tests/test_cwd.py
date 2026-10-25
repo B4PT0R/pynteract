@@ -64,18 +64,20 @@ def test_internal_cwd_argument_sets_shell_cwd_only(tmp_path: Path):
         os.chdir(previous)
 
 
-def test_ambient_cwd_mode_uses_and_mutates_process_cwd(tmp_path: Path):
+@pytest.mark.parametrize("options", [{}, {"use_internal_cwd": False}])
+@pytest.mark.parametrize("change_code", ["os.chdir({target!r})", "%cd {target}"])
+def test_ambient_cwd_mode_uses_and_mutates_process_cwd(tmp_path: Path, options, change_code):
     start = tmp_path / "start"
     target = tmp_path / "target"
     start.mkdir()
     target.mkdir()
 
-    shell = Shell(display_mode="none", use_internal_cwd=False)
+    shell = Shell(display_mode="none", **options)
 
     previous = os.getcwd()
     try:
         os.chdir(start)
-        resp = shell.run(f"import os\nprint(os.getcwd())\nos.chdir({str(target)!r})")
+        resp = shell.run("import os\nprint(os.getcwd())\n" + change_code.format(target=str(target)))
         assert resp.exception is None
         assert str(start) in resp.stdout
         assert os.getcwd() == str(target)
@@ -164,3 +166,17 @@ async def test_arun_ambient_cwd_accepts_cwd_and_mutates_process_cwd(tmp_path: Pa
         assert os.getcwd() == str(target)
     finally:
         os.chdir(previous)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_default_run_does_not_call_chdir(monkeypatch, asynchronous):
+    shell = Shell(display_mode="none")
+    assert shell.use_internal_cwd is False
+
+    def unexpected_chdir(path):
+        raise AssertionError("default execution must not chdir")
+
+    monkeypatch.setattr(os, "chdir", unexpected_chdir)
+    response = await shell.arun("42") if asynchronous else shell.run("42")
+    assert response.exception is None
+    assert response.result == 42

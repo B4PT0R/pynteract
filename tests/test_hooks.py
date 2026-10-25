@@ -8,27 +8,27 @@ from pynteract import Shell
 def test_basic_hooks_flow_and_mutation():
     calls: list[tuple[str, object]] = []
 
-    def input_hook(code: str, ctx) -> None:
+    def input_hook(code: str) -> None:
         calls.append(("input", code))
 
-    def pre_run_hook(code: str, ctx) -> str:
+    def pre_run_hook(code: str) -> str:
         calls.append(("pre_run", code))
         return code.replace("VALUE", "41 + 1")
 
-    def code_block_hook(block: str, ctx) -> None:
+    def code_block_hook(block: str) -> None:
         calls.append(("block", block.strip()))
 
-    def pre_execute_hook(node: ast.AST, source: str, ctx) -> ast.AST:
+    def pre_execute_hook(node: ast.AST, source: str) -> ast.AST:
         calls.append(("pre_execute", type(node).__name__))
         return node
 
-    def post_execute_hook(node: ast.AST, result: object, ctx) -> None:
+    def post_execute_hook(node: ast.AST, result: object) -> None:
         calls.append(("post_execute", (type(node).__name__, result)))
 
-    def display_hook(obj: object, _kwargs: dict, ctx) -> None:
+    def display_hook(obj: object, _kwargs: dict) -> None:
         calls.append(("display", obj))
 
-    def post_run_hook(resp, ctx):
+    def post_run_hook(resp):
         calls.append(("post_run", resp.result))
         resp.processed_input = (resp.processed_input or "") + "\n# post_run"
         return resp
@@ -62,7 +62,7 @@ def test_basic_hooks_flow_and_mutation():
 def test_namespace_change_hook_sees_diff():
     diffs: list[tuple[set[str], set[str]]] = []
 
-    def namespace_change_hook(old, new, _locals, ctx):
+    def namespace_change_hook(old, new, _locals):
         diffs.append((set(old.keys()), set(new.keys())))
 
     shell = Shell(display_mode="none", namespace_change_hook=namespace_change_hook)

@@ -286,144 +286,148 @@ def _ensure_ptk_shared() -> dict[str, Any]:
             return
         buf.insert_text(indent)
 
-        @kb.add(Keys.BackTab)
-        def _(event):
-            buf = event.app.current_buffer
-            if buf.selection_state:
-                _indent_or_dedent_selection(buf, dedent=True)
-                return
+    @kb.add(Keys.BackTab)
+    def _(event):
+        buf = event.app.current_buffer
+        if buf.selection_state:
+            _indent_or_dedent_selection(buf, dedent=True)
+            return
 
-            doc = buf.document
-            line = doc.current_line
-            if line.startswith(" "):
-                lead = 0
-                for ch in line:
-                    if ch == " ":
-                        lead += 1
-                    else:
-                        break
-                n = min(lead, _spaces_to_prev_boundary(" " * lead))
-            else:
-                n = _indent_len_for_line(line, indent)
-            if n <= 0:
-                return
-
-            # Dedent the current line.
-            starts = _line_starts(doc.text)
-            row = doc.cursor_position_row
-            line_start = starts[row]
-            new_text = doc.text[:line_start] + doc.text[line_start + n :]
-            new_cursor = max(doc.cursor_position - min(n, doc.cursor_position - line_start), line_start)
-            buf.set_document(Document(new_text, cursor_position=new_cursor), bypass_readonly=True)
-
-        @kb.add(Keys.ControlC)
-        def _(event):
-            buf = event.app.current_buffer
-            if buf.selection_state:
-                buf.copy_selection()
-                buf.exit_selection()
-                return
-            raise KeyboardInterrupt
-
-        @kb.add(Keys.ControlX)
-        def _(event):
-            buf = event.app.current_buffer
-            if buf.selection_state:
-                buf.cut_selection()
-                buf.exit_selection()
-
-        @kb.add(Keys.ControlV)
-        def _(event):
-            buf = event.app.current_buffer
-            buf.paste_clipboard_data(event.app.clipboard.get_data())
-
-        @kb.add(Keys.Enter)
-        def _(event):
-            buf = event.app.current_buffer
-            multiline_attr = getattr(buf, "multiline", False)
-            if callable(multiline_attr):
-                is_multiline = bool(multiline_attr())
-            else:
-                # In prompt_toolkit, this may be a Filter; calling bool(filter) raises.
-                try:
-                    is_multiline = bool(multiline_attr)
-                except Exception:
-                    is_multiline = False
-
-            if not is_multiline:
-                buf.validate_and_handle()
-                return
-
-            doc = buf.document
-            before = doc.current_line_before_cursor.rstrip()
-            current_indent = ""
-            for ch in doc.current_line:
-                if ch in (" ", "\t"):
-                    current_indent += ch
+        doc = buf.document
+        line = doc.current_line
+        if line.startswith(" "):
+            lead = 0
+            for ch in line:
+                if ch == " ":
+                    lead += 1
                 else:
                     break
-            extra = indent if before.endswith(":") else ""
-            buf.insert_text("\n" + current_indent + extra)
+            n = min(lead, _spaces_to_prev_boundary(" " * lead))
+        else:
+            n = _indent_len_for_line(line, indent)
+        if n <= 0:
+            return
 
-        @kb.add(Keys.Backspace)
-        def _(event):
-            buf = event.app.current_buffer
+        # Dedent the current line.
+        starts = _line_starts(doc.text)
+        row = doc.cursor_position_row
+        line_start = starts[row]
+        new_text = doc.text[:line_start] + doc.text[line_start + n :]
+        new_cursor = max(doc.cursor_position - min(n, doc.cursor_position - line_start), line_start)
+        buf.set_document(Document(new_text, cursor_position=new_cursor), bypass_readonly=True)
 
-            # If there is a selection, delete it (common editor behavior).
-            if buf.selection_state:
-                buf.cut_selection()
-                buf.exit_selection()
-                return
+    @kb.add(Keys.ControlC)
+    def _(event):
+        buf = event.app.current_buffer
+        if buf.selection_state:
+            event.app.clipboard.set_data(buf.copy_selection())
+            buf.exit_selection()
+            return
+        raise KeyboardInterrupt
 
-            doc = buf.document
-            before = doc.current_line_before_cursor
-            if before and set(before) == {" "}:
-                # Only spaces before cursor on this line: snap back to the previous
-                # indentation boundary (multiples of 4 spaces).
-                n = indent.count(" ")
-                remainder = len(before) % n
-                delete_n = n if remainder == 0 else remainder
-                buf.delete_before_cursor(count=delete_n)
-                return
+    @kb.add(Keys.ControlX)
+    def _(event):
+        buf = event.app.current_buffer
+        if buf.selection_state:
+            event.app.clipboard.set_data(buf.cut_selection())
+            buf.exit_selection()
 
-            buf.delete_before_cursor(count=1)
+    @kb.add(Keys.ControlV)
+    def _(event):
+        buf = event.app.current_buffer
+        buf.paste_clipboard_data(event.app.clipboard.get_data())
 
-        def _exit_selection(event) -> None:
-            buf = event.app.current_buffer
-            if buf.selection_state:
-                buf.exit_selection()
+    @kb.add(Keys.Enter)
+    def _(event):
+        buf = event.app.current_buffer
+        multiline_attr = getattr(buf, "multiline", False)
+        if callable(multiline_attr):
+            is_multiline = bool(multiline_attr())
+        else:
+            # In prompt_toolkit, this may be a Filter; calling bool(filter) raises.
+            try:
+                is_multiline = bool(multiline_attr)
+            except Exception:
+                is_multiline = False
 
-        # Arrow movement cancels selection (editor-like behavior).
-        @kb.add(Keys.Left)
-        def _(event):
-            _exit_selection(event)
-            event.current_buffer.cursor_left()
+        if not is_multiline:
+            buf.validate_and_handle()
+            return
 
-        @kb.add(Keys.Right)
-        def _(event):
-            _exit_selection(event)
-            event.current_buffer.cursor_right()
+        doc = buf.document
+        before = doc.current_line_before_cursor.rstrip()
+        current_indent = ""
+        for ch in doc.current_line:
+            if ch in (" ", "\t"):
+                current_indent += ch
+            else:
+                break
+        extra = indent if before.endswith(":") else ""
+        buf.insert_text("\n" + current_indent + extra)
 
-        @kb.add(Keys.Up)
-        def _(event):
-            _exit_selection(event)
-            event.current_buffer.cursor_up()
+    @kb.add("escape", "enter")
+    def _(event):
+        event.app.current_buffer.validate_and_handle()
 
-        @kb.add(Keys.Down)
-        def _(event):
-            _exit_selection(event)
-            event.current_buffer.cursor_down()
+    @kb.add(Keys.Backspace)
+    def _(event):
+        buf = event.app.current_buffer
 
-        # History browsing (editor-like): Alt+Up / Alt+Down.
-        @kb.add("escape", "up")
-        def _(event):
-            _exit_selection(event)
-            event.current_buffer.history_backward(count=1)
+        # If there is a selection, delete it (common editor behavior).
+        if buf.selection_state:
+            buf.cut_selection()
+            buf.exit_selection()
+            return
 
-        @kb.add("escape", "down")
-        def _(event):
-            _exit_selection(event)
-            event.current_buffer.history_forward(count=1)
+        doc = buf.document
+        before = doc.current_line_before_cursor
+        if before and set(before) == {" "}:
+            # Only spaces before cursor on this line: snap back to the previous
+            # indentation boundary (multiples of 4 spaces).
+            n = indent.count(" ")
+            remainder = len(before) % n
+            delete_n = n if remainder == 0 else remainder
+            buf.delete_before_cursor(count=delete_n)
+            return
+
+        buf.delete_before_cursor(count=1)
+
+    def _exit_selection(event) -> None:
+        buf = event.app.current_buffer
+        if buf.selection_state:
+            buf.exit_selection()
+
+    # Arrow movement cancels selection (editor-like behavior).
+    @kb.add(Keys.Left)
+    def _(event):
+        _exit_selection(event)
+        event.current_buffer.cursor_left()
+
+    @kb.add(Keys.Right)
+    def _(event):
+        _exit_selection(event)
+        event.current_buffer.cursor_right()
+
+    @kb.add(Keys.Up)
+    def _(event):
+        _exit_selection(event)
+        event.current_buffer.cursor_up()
+
+    @kb.add(Keys.Down)
+    def _(event):
+        _exit_selection(event)
+        event.current_buffer.cursor_down()
+
+    # History browsing (editor-like): Alt+Up / Alt+Down.
+    @kb.add("escape", "up")
+    def _(event):
+        _exit_selection(event)
+        event.current_buffer.history_backward(count=1)
+
+    @kb.add("escape", "down")
+    def _(event):
+        _exit_selection(event)
+        event.current_buffer.history_forward(count=1)
 
     _PTK_SHARED = {
         "PromptSession": PromptSession,

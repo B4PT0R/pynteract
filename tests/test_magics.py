@@ -26,7 +26,7 @@ class TestMagic:
             m.mode = "line"  # type: ignore
 
 
-# ── _render_template — safe eval ──────────────────────────────────────────────
+# ── _render_template — trusted eval ──────────────────────────────────────────────
 
 class TestRenderTemplate:
     def setup_method(self, _):
@@ -63,15 +63,14 @@ class TestRenderTemplate:
         with pytest.raises(ValueError, match="Empty"):
             self.p._render_template("{}", {}, {})
 
-    # -- sandbox --
+    # -- curated builtin names (not a security boundary) --
 
     def test_blocks_import(self):
         with pytest.raises(NameError):
             self.p._render_template("{__import__('os')}", {}, {})
 
     def test_blocks_builtins_escape(self):
-        # La sandbox remplace __builtins__ par un dict whitelist sans '__import__'.
-        # Tenter d'y accéder lève KeyError (clé absente) — le vecteur d'évasion est bloqué.
+        # The default builtins dict omits __import__; this is not a sandbox.
         with pytest.raises((NameError, TypeError, KeyError)):
             self.p._render_template(
                 "{__builtins__['__import__']('os')}", {}, {}

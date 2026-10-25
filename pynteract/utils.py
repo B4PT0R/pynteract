@@ -1,4 +1,7 @@
+import contextvars
+import functools
 import hashlib
+import inspect
 import secrets
 import string
 import sys
@@ -12,6 +15,16 @@ _ID_ALPHABET = string.ascii_letters + string.digits
 def content_hash(content: str) -> str:
     """Return a SHA256 hex digest for the provided content string."""
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def call_sync_hook(hook, *args):
+    """Reject accidental awaitables without leaking an unawaited coroutine."""
+    result = hook(*args)
+    if inspect.isawaitable(result):
+        if inspect.iscoroutine(result):
+            result.close()
+        raise TypeError("This hook must be synchronous; only stdout/stderr hooks support async")
+    return result
 
 
 def short_id(length: int = 10) -> str:
@@ -69,6 +82,7 @@ def Thread(*args, **kwargs) -> ThreadBase:
     transparent pass-through.
     """
     thread = ThreadBase(*args, **kwargs)
+    thread.run = functools.partial(contextvars.copy_context().run, thread.run)
     if _thread_context_hook is not None:
         _thread_context_hook(thread)
     return thread

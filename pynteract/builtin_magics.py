@@ -3,15 +3,13 @@ from __future__ import annotations
 import ast
 import os
 import shlex
-import subprocess
-import sys
 import time
 import timeit
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .utils import Thread
 from . import namespace_utils
+from .scripts import read_script, script_context
 
 
 if TYPE_CHECKING:
@@ -122,23 +120,24 @@ def register_builtin_magics(shell: "Shell") -> None:
 
     @shell.register_magic(name="timeit", mode="line")
     def _timeit(arg: str) -> str:
-        parts = shlex.split(arg) if arg.strip() else []
         n = 1000
         r = 3
-        code_parts: list[str] = []
-        i = 0
-        while i < len(parts):
-            if parts[i] == "-n" and i + 1 < len(parts):
-                n = int(parts[i + 1])
-                i += 2
-                continue
-            if parts[i] == "-r" and i + 1 < len(parts):
-                r = int(parts[i + 1])
-                i += 2
-                continue
-            code_parts.append(parts[i])
-            i += 1
-        code = " ".join(code_parts).strip()
+        code = arg.strip()
+        # Consume only leading options; Python source is not shell syntax.
+        while code:
+            parts = code.split(None, 2)
+            if parts[0] not in ("-n", "-r"):
+                break
+            if len(parts) < 2:
+                raise ValueError(f"{parts[0]} requires a positive integer")
+            count = int(parts[1])
+            if count <= 0:
+                raise ValueError(f"{parts[0]} requires a positive integer")
+            if parts[0] == "-n":
+                n = count
+            else:
+                r = count
+            code = parts[2] if len(parts) > 2 else ""
         if not code:
             return "Usage: %timeit [-n N] [-r R] <code>"
 
@@ -158,30 +157,10 @@ def register_builtin_magics(shell: "Shell") -> None:
 
     @shell.register_magic(name="bash", mode="cell")
     def _bash_cell(script: str) -> int:
-        process = subprocess.Popen(
-            ["bash", "-lc", script],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-
-        def _stream_output(stream, out_stream):
-            for line in iter(stream.readline, ""):
-                out_stream.write(line)
-                out_stream.flush()
-            stream.close()
-
-        t_out = Thread(target=_stream_output, args=(process.stdout, sys.stdout))
-        t_err = Thread(target=_stream_output, args=(process.stderr, sys.stderr))
-        t_out.start()
-        t_err.start()
-        t_out.join()
-        t_err.join()
-        return process.wait()
+        return shell._run_process(["bash", "-lc", script])
 
     @shell.register_magic(name="run", mode="line")
-    def _run(arg: str) -> str:
+    def _run(arg: str) -> str | None:
         """Execute a Python script, IPython-style.
 
         - `%run script.py [args...]` runs in a fresh `__main__` namespace, then merges symbols into the current shell.
@@ -203,29 +182,26 @@ def register_builtin_magics(shell: "Shell") -> None:
         argv = [str(script_path), *parts[1:]]
 
         try:
-            source = script_path.read_text(encoding="utf-8", errors="replace")
+            source = read_script(script_path)
         except OSError as exc:
             raise FileNotFoundError(f"Could not read script: {script_path}") from exc
 
-        saved_argv = sys.argv[:]
-        saved_main = sys.modules.get("__main__")
         saved_file = shell.namespace.get("__file__")
+        saved_name = shell.namespace.get("__name__")
 
         try:
-            sys.argv = argv
-            if interactive:
-                target_ns = shell.namespace
-                shell.run(source, globals=target_ns, locals=target_ns, filename=str(script_path))
-            else:
-                target_ns: dict[str, Any] = {"__name__": "__main__"}
-                for key in ("__builtins__", "display", "__magics__", "__shell__", "magic"):
-                    if key in shell.namespace:
-                        target_ns[key] = shell.namespace[key]
-
+            with script_context(script_path, argv):
+                if interactive:
+                    target_ns = shell.namespace
+                else:
+                    target_ns: dict[str, Any] = {}
+                    for key in ("__builtins__", "display", "__magics__", "__shell__", "magic"):
+                        if key in shell.namespace:
+                            target_ns[key] = shell.namespace[key]
                 namespace_utils.NamespaceManager.prepare_namespace(
                     target_ns, filename=str(script_path), module_name="__main__"
                 )
-                shell.run(source, globals=target_ns, locals=target_ns, filename=str(script_path))
+                response = shell.run(source, globals=target_ns, locals=target_ns, filename=str(script_path))
 
                 hidden = {
                     "__builtins__",
@@ -244,17 +220,18 @@ def register_builtin_magics(shell: "Shell") -> None:
                     "__",
                     "___",
                 }
-                for name, value in target_ns.items():
+                for name, value in (() if interactive else target_ns.items()):
                     if name in hidden or name.startswith("__"):
                         continue
                     shell.namespace[name] = value
         finally:
-            sys.argv = saved_argv
-            if saved_file is not None:
-                shell.namespace["__file__"] = saved_file
-            if saved_main is None:
-                sys.modules.pop("__main__", None)
-            else:
-                sys.modules["__main__"] = saved_main
+            if interactive:
+                shell.namespace["__name__"] = saved_name
+                if saved_file is None:
+                    shell.namespace.pop("__file__", None)
+                else:
+                    shell.namespace["__file__"] = saved_file
 
-        return ""
+        if response.exception is not None:
+            raise response.exception
+        return None

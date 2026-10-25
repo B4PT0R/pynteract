@@ -7,6 +7,7 @@ from importlib import metadata
 from pathlib import Path
 
 from .shell import Shell
+from .scripts import read_script, script_context
 
 
 def build_shell(*, namespace: dict | None = None) -> Shell:
@@ -16,15 +17,18 @@ def build_shell(*, namespace: dict | None = None) -> Shell:
     return Shell(module_name="__main__", namespace=namespace)
 
 
-def _run_script(shell: Shell, script: Path, argv: list[str]) -> int:
-    code = script.read_text(encoding="utf-8", errors="replace")
+def _run_script(shell: Shell, script: Path) -> int:
+    code = read_script(script)
     try:
-        sys.argv = argv
         resp = shell.run(code, filename=str(script))
         return 0 if resp.exception is None else 1
-    finally:
-        # Caller decides whether to restore sys.argv / sys.modules['__main__'].
-        pass
+    except SystemExit as exc:
+        if exc.code is None:
+            return 0
+        if isinstance(exc.code, int):
+            return exc.code
+        sys.stderr.write(str(exc.code) + "\n")
+        return 1
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -78,35 +82,22 @@ def main(argv: list[str] | None = None) -> int:
         script_path = script_path.resolve()
         script_argv = [str(script_path), *list(args.script_args or [])]
 
-        # Run scripts in a fresh __main__ namespace (like `python script.py` / IPython %run).
-        saved_argv = sys.argv[:]
-        saved_main = sys.modules.get("__main__")
-        shell = build_shell(namespace={})
-        sys.argv = script_argv
-
-        if args.interact:
-            startup_exit = shell._run_startup(announce=False)
-            if startup_exit != 0:
-                sys.argv = saved_argv
-                if saved_main is None:
-                    sys.modules.pop("__main__", None)
-                else:
-                    sys.modules["__main__"] = saved_main
-                return startup_exit
-
-        exit_code = _run_script(shell, script_path, script_argv)
-
-        if args.no_interact or not args.interact:
-            sys.argv = saved_argv
-            if saved_main is None:
-                sys.modules.pop("__main__", None)
-            else:
-                sys.modules["__main__"] = saved_main
-            return exit_code
-        # Else: keep script argv and __main__ module and fall through into interactive.
+        # Keep script state through -i, but always restore the hosting process.
+        with script_context(script_path, script_argv), build_shell(namespace={}) as shell:
+            if args.interact:
+                startup_exit = shell._run_startup(announce=False)
+                if startup_exit != 0:
+                    return startup_exit
+            try:
+                exit_code = _run_script(shell, script_path)
+            except (OSError, UnicodeError, SyntaxError) as exc:
+                sys.stderr.write(f"pynteract: could not read script: {script_path} ({exc})\n")
+                return 2
+            if args.no_interact or not args.interact:
+                return exit_code
+            return int(shell.interact())
     else:
-        shell = build_shell()
-        if args.no_interact:
-            return 0
-
-    return int(shell.interact())
+        with build_shell() as shell:
+            if args.no_interact:
+                return 0
+            return int(shell.interact())

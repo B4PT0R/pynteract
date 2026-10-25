@@ -104,19 +104,19 @@ class TestRunErrors:
 class TestSyncHooks:
     def test_stdout_hook_called(self, shell):
         received = []
-        shell.hooks["stdout_hook"] = lambda data, buf, ctx: received.append(data)
+        shell.hooks["stdout_hook"] = lambda data, buf: received.append(data)
         shell.run("print('ping')")
         assert any("ping" in chunk for chunk in received)
 
     def test_stderr_hook_called(self, shell):
         received = []
-        shell.hooks["stderr_hook"] = lambda data, buf, ctx: received.append(data)
+        shell.hooks["stderr_hook"] = lambda data, buf: received.append(data)
         shell.run("import sys; sys.stderr.write('oops\\n')")
         assert any("oops" in chunk for chunk in received)
 
     def test_hook_receives_cumulative_buffer(self, shell):
         buffers = []
-        shell.hooks["stdout_hook"] = lambda data, buf, ctx: buffers.append(buf)
+        shell.hooks["stdout_hook"] = lambda data, buf: buffers.append(buf)
         shell.run("print('a')\nprint('b')")
         # cumulative buffer should grow
         assert len(buffers) >= 2
@@ -124,7 +124,7 @@ class TestSyncHooks:
 
     def test_hook_removal_stops_calls(self, shell):
         received = []
-        shell.hooks["stdout_hook"] = lambda data, buf, ctx: received.append(data)
+        shell.hooks["stdout_hook"] = lambda data, buf: received.append(data)
         shell.run("print('first')")
         del shell.hooks["stdout_hook"]
         shell.run("print('second')")
@@ -134,7 +134,7 @@ class TestSyncHooks:
         received = []
         shell = Shell(
             silent=True,
-            stdout_hook=lambda data, buf, ctx: received.append(data),
+            stdout_hook=lambda data, buf: received.append(data),
         )
 
         response = shell.run("print('quiet')")
@@ -146,7 +146,7 @@ class TestSyncHooks:
         received = []
         shell = Shell(
             silent=True,
-            stdout_hook=lambda data, buf, ctx: received.append(data),
+            stdout_hook=lambda data, buf: received.append(data),
         )
 
         shell.run("print('loud')", silent=False)
@@ -155,7 +155,7 @@ class TestSyncHooks:
 
     def test_run_silent_override_can_suppress_hooks(self):
         received = []
-        shell = Shell(stdout_hook=lambda data, buf, ctx: received.append(data))
+        shell = Shell(stdout_hook=lambda data, buf: received.append(data))
 
         response = shell.run("print('quiet')", silent=True)
 

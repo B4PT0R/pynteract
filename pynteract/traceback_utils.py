@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import traceback
+import linecache
 from typing import Any, Optional
 
 
@@ -15,21 +16,6 @@ def _is_user_frame(*, filename: str, current_filename: str, history: dict[str, A
     return False
 
 
-def _format_syntax_error_block(exc: SyntaxError) -> str:
-    filename = getattr(exc, "filename", None) or "<unknown>"
-    lineno = getattr(exc, "lineno", None) or 1
-    text = getattr(exc, "text", None) or ""
-    offset = getattr(exc, "offset", None)
-    out = [f'  File "{filename}", line {lineno}\n']
-    if text:
-        stripped = text.rstrip("\n")
-        out.append(f"    {stripped}\n")
-        if isinstance(offset, int) and offset > 0:
-            out.append("    " + (" " * (offset - 1)) + "^\n")
-    out.extend(traceback.format_exception_only(type(exc), exc))
-    return "".join(out)
-
-
 def render_snippet(
     *,
     filename: str,
@@ -42,7 +28,10 @@ def render_snippet(
 
     This mirrors the previous `Shell._render_snippet` behavior.
     """
-    if filename == current_filename:
+    cached = linecache.getlines(filename)
+    if cached:
+        source = "".join(cached)
+    elif filename == current_filename:
         source = current_code or ""
     elif filename in history:
         response = history.get(filename)
@@ -80,22 +69,40 @@ def build_enriched_traceback(
     current_filename: str,
     current_code: Optional[str],
     history: dict[str, Any],
+    cell_codes=None,
+    source_names=None,
 ) -> tuple[str, dict[str, Any]]:
-    """Build an enriched traceback string + structured frame info."""
+    """Render from the first cell frame, preserving every downstream call.
+
+    Compiled code identity defines the boundary, not a package-path blacklist.
+    Compilation errors have no executed cell frame; show their source location
+    without the parser/compiler stack. Other errors without a cell frame (for
+    example a failing pre-execution hook) retain their stack for diagnosis.
+    The original exception traceback is never modified.
+    """
     def format_one(exc: BaseException) -> tuple[str, dict[str, Any]]:
-        te = traceback.TracebackException(type(exc), exc, exc.__traceback__)
-        output = ["Traceback (most recent call last):\n"]
+        tb = exc_traceback if exc is exc_value else exc.__traceback__
+        te = traceback.TracebackException(type(exc), exc, tb)
         enriched_frames: list[dict[str, Any]] = []
 
         stack = list(te.stack)
         start_index = 0
-        for i, frame in enumerate(stack):
-            if _is_user_frame(filename=frame.filename, current_filename=current_filename, history=history):
+        for i, (frame, _) in enumerate(traceback.walk_tb(tb)):
+            is_cell = (frame.f_code in cell_codes if cell_codes is not None else
+                       _is_user_frame(filename=frame.f_code.co_filename,
+                                      current_filename=current_filename, history=history))
+            if is_cell:
                 start_index = i
                 break
+        else:
+            if isinstance(exc, SyntaxError):
+                start_index = len(stack)
 
-        for frame in stack[start_index:]:
-            output.append(f'  File "{frame.filename}", line {frame.lineno}, in {frame.name}\n')
+        visible_stack = stack[start_index:]
+        output = ["Traceback (most recent call last):\n"] if visible_stack else []
+        for frame in visible_stack:
+            display_filename = (source_names or {}).get(frame.filename, frame.filename)
+            output.append(f'  File "{display_filename}", line {frame.lineno}, in {frame.name}\n')
             snippet = render_snippet(
                 filename=frame.filename,
                 lineno=frame.lineno,
@@ -110,7 +117,7 @@ def build_enriched_traceback(
 
             enriched_frames.append(
                 {
-                    "filename": frame.filename,
+                    "filename": display_filename,
                     "lineno": frame.lineno,
                     "name": frame.name,
                     "line": frame.line,
@@ -127,35 +134,43 @@ def build_enriched_traceback(
         }
         return "".join(output), enriched
 
+    seen: set[int] = set()
+
     def format_chain(exc: BaseException) -> tuple[str, list[dict[str, Any]]]:
-        parts: list[dict[str, Any]] = []
+        # Walk causes iteratively: user code can create cycles or very long
+        # chains. Never replace the original error with RecursionError.
+        chain = []
+        while id(exc) not in seen:
+            seen.add(id(exc))
+            cause = exc.__cause__
+            context = exc.__context__ if not exc.__suppress_context__ else None
+            previous = cause if cause is not None else context
+            separator = ("The above exception was the direct cause of the following exception:"
+                         if cause is not None else
+                         "During handling of the above exception, another exception occurred:")
+            chain.append((exc, separator))
+            if previous is None:
+                break
+            exc = previous
 
-        if exc.__cause__ is not None:
-            text, chain_parts = format_chain(exc.__cause__)
-            parts.extend(chain_parts)
-            text += "\nThe above exception was the direct cause of the following exception:\n\n"
-            one_text, one_enriched = format_one(exc)
-            parts.append(one_enriched)
-            return text + one_text, parts
-
-        if exc.__context__ is not None and not exc.__suppress_context__:
-            text, chain_parts = format_chain(exc.__context__)
-            parts.extend(chain_parts)
-            text += "\nDuring handling of the above exception, another exception occurred:\n\n"
-            one_text, one_enriched = format_one(exc)
-            parts.append(one_enriched)
-            return text + one_text, parts
-
-        # Base case
-        if isinstance(exc, SyntaxError) and exc.__traceback__ is None:
-            # SyntaxError from parsing/compiling may have no traceback frames.
-            text = "Traceback (most recent call last):\n" + _format_syntax_error_block(exc)
-            parts.append({"frames": [], "skipped_frames": 0, "exception_lines": traceback.format_exception_only(type(exc), exc)})
-            return text, parts
-
-        one_text, one_enriched = format_one(exc)
-        parts.append(one_enriched)
-        return one_text, parts
+        output = []
+        parts = []
+        for exc, separator in reversed(chain):
+            if output:
+                output.append("\n" + separator + "\n\n")
+            text, enriched = format_one(exc)
+            output.append(text)
+            if isinstance(exc, BaseExceptionGroup):
+                children = []
+                for i, child in enumerate(exc.exceptions, 1):
+                    child_text, child_parts = format_chain(child)
+                    output.append(f"  +-- sub-exception {i} --\n")
+                    output.append("".join("  | " + line for line in child_text.splitlines(True))
+                                  or "  | [exception already shown]\n")
+                    children.append({"exceptions": child_parts})
+                enriched["children"] = children
+            parts.append(enriched)
+        return "".join(output), parts
 
     output_text, chain_enriched = format_chain(exc_value)
     enriched = {

@@ -1,12 +1,17 @@
 import io
 import asyncio
+import contextvars
+import inspect
+import threading
+from contextlib import contextmanager
 from typing import Optional, Callable
 from collections import deque
 import sys
 from .ptk import prompt
-from .context import CAPTURE_STREAMS, RUN_CONTEXT, SILENT_STDIO, PENDING_STDIN_PROMPT
+from .utils import call_sync_hook
+from .context import CAPTURE_STDIN, CAPTURE_STREAMS, SILENT_STDIO, PENDING_STDIN_PROMPT
 
-def stdout_write(data: str, buffer: str, ctx) -> None:
+def stdout_write(data: str, buffer: str) -> None:
     """Default stdout hook that mirrors captured output to the real stdout."""
     if isinstance(sys.stdout, (Stream, StdIOProxy)):
         sys.__stdout__.write(data)
@@ -15,7 +20,7 @@ def stdout_write(data: str, buffer: str, ctx) -> None:
         sys.stdout.write(data)
         sys.stdout.flush()
 
-def stderr_write(data: str, buffer: str, ctx) -> None:
+def stderr_write(data: str, buffer: str) -> None:
     """Default stderr hook that mirrors captured output to the real stderr."""
     if isinstance(sys.stderr, (Stream, StdIOProxy)):
         sys.__stderr__.write(data)
@@ -24,9 +29,9 @@ def stderr_write(data: str, buffer: str, ctx) -> None:
         sys.stderr.write(data)
         sys.stderr.flush()
 
-def stdin_readline(ctx) -> str:
+def stdin_readline() -> str:
     """Fallback stdin hook that reads from the console."""
-    if isinstance(sys.stdin, StdinProxy):
+    if isinstance(sys.stdin, (StdinProxy, StdinRoutingProxy)):
         try:
             if PENDING_STDIN_PROMPT.get():
                 # builtin input(prompt) prints the prompt to stdout before reading stdin.
@@ -44,47 +49,75 @@ def stdin_readline(ctx) -> str:
         return sys.stdin.readline()
 
 
-def _fire_async_hook(coro, loop=None) -> None:
-    """Schedule a coroutine on the running event loop, if any.
+class AsyncHookQueue:
+    """One ordered, owned stream-hook worker per async Collector."""
 
-    Called from synchronous stream-flush paths when a hook turns out to be a
-    coroutine function.  Three strategies are tried in order:
+    def __init__(self):
+        self.loop = asyncio.get_running_loop()
+        self.pending = deque()
+        self.ready = asyncio.Event()
+        self.task = None
+        self.error = None
+        self.closed = False
+        self.lock = threading.Lock()
 
-    1. ``loop`` is provided explicitly (cross-thread path from ``arun``) →
-       ``loop.call_soon_threadsafe`` schedules the task on the caller's loop.
-    2. A running loop exists in *this* thread → ``asyncio.ensure_future``.
-    3. No usable loop → the coroutine is closed and a ``RuntimeWarning`` is emitted.
+    def submit(self, hook, data, stream, end):
+        with self.lock:
+            if self.closed:
+                raise RuntimeError("Async stream capture has already finished")
+            # Store an offset, not a cumulative string per chunk. A slow hook
+            # must not retain quadratically many copies of captured output.
+            self.pending.append((hook, data, stream, end))
+        self.loop.call_soon_threadsafe(self._start)
 
-    Args:
-        coro: The coroutine to schedule.
-        loop: Optional event loop to use. When provided (e.g. captured by
-              ``Shell.arun`` before offloading to a thread), cross-thread
-              scheduling is used unconditionally.
-    """
-    # Fast path: caller supplied an explicit loop (cross-thread from arun).
-    if loop is not None and not loop.is_closed():
-        loop.call_soon_threadsafe(loop.create_task, coro)
-        return
+    def _start(self):
+        if self.task is None and self.pending:
+            ctx = contextvars.copy_context()
+            ctx.run(CAPTURE_STREAMS.set, None)
+            ctx.run(CAPTURE_STDIN.set, None)
+            self.task = self.loop.create_task(self._work(), context=ctx)
+        self.ready.set()
 
-    # Same-thread path: try to find the running loop.
-    try:
-        running = asyncio.get_running_loop()
-    except RuntimeError:
-        running = None
+    async def _work(self):
+        while True:
+            with self.lock:
+                if self.pending:
+                    item = self.pending.popleft()
+                elif self.closed:
+                    return
+                else:
+                    item = None
+                    self.ready.clear()
+            if item is None:
+                await self.ready.wait()
+                continue
+            hook, data, stream, end = item
+            try:
+                await hook(data, stream._snapshot(end))
+            except Exception as exc:
+                if self.error is None:
+                    self.error = exc
 
-    if running is not None:
-        asyncio.ensure_future(coro, loop=running)
-        return
+    async def drain(self):
+        with self.lock:
+            self.closed = True
+        self._start()
+        try:
+            if self.task is not None:
+                await self.task
+        except BaseException:
+            await self.cancel()
+            raise
+        if self.error is not None:
+            raise self.error
 
-    # No usable loop — warn and discard.
-    coro.close()
-    import warnings
-    warnings.warn(
-        "An async stream hook was called but no event loop is available; "
-        "hook output will be dropped.",
-        RuntimeWarning,
-        stacklevel=3,
-    )
+    async def cancel(self):
+        with self.lock:
+            self.closed = True
+            self.pending.clear()
+        if self.task is not None:
+            self.task.cancel()
+            await asyncio.gather(self.task, return_exceptions=True)
 
 
 class Stream(io.IOBase):
@@ -95,11 +128,8 @@ class Stream(io.IOBase):
     for real-time processing and display. It ensures efficient data handling by
     maintaining a maximum buffer size and flushing data when this size is exceeded or on newlines.
 
-    Hooks may be either plain callables **or async coroutine functions**.  When an
-    async hook is detected during ``flush()``, it is scheduled on the running event
-    loop via :func:`_fire_async_hook` so that the synchronous write path is never
-    blocked.  This makes ``Stream`` transparently compatible with both sync and async
-    embedders (e.g. ``Shell.run`` and ``Shell.arun``).
+    Async stdout/stderr hooks are queued by an async Collector and drained in
+    emission order before it exits. Sync capture requires synchronous hooks.
 
     Args:
         shell: Shell instance whose hook attribute is consulted dynamically.
@@ -148,7 +178,7 @@ class Stream(io.IOBase):
         shell: object,
         *,
         hook_key: str,
-        default_hook: Callable[[str, str, object], None],
+        default_hook: Callable[[str, str], None],
         delegate: Optional[io.TextIOBase] = None,
         buffer_size: int = 2048,
     ) -> None:
@@ -162,8 +192,10 @@ class Stream(io.IOBase):
         self._binary_buffer = Stream._BinaryBufferProxy(self)
         self.buffer_size = buffer_size
         self._pending_buffer = ""
-        self.cache_buffer = ""
-        self._loop: Optional[asyncio.AbstractEventLoop] = None  # set by Shell.arun()
+        self._cache = io.StringIO()
+        self._cache_lock = threading.Lock()
+        self.async_hooks = None
+        self._capture_parent = None
 
     def writable(self) -> bool:
         return True
@@ -255,11 +287,9 @@ class Stream(io.IOBase):
     def flush(self, data_to_flush=None) -> None:  # type: ignore[override]
         """Flush buffered data through the hook (sync or async).
 
-        When the resolved hook is a plain callable it is invoked synchronously,
-        preserving the original behaviour.  When it is a coroutine function the
-        resulting coroutine is scheduled on the running event loop via
-        :func:`_fire_async_hook` — the flush call returns immediately without
-        blocking.
+        Synchronous hooks run immediately. Async hooks are submitted to the
+        owning async Collector's ordered queue; its exit waits for completion.
+        Without an async Collector they raise TypeError rather than dropping IO.
 
         Args:
             data_to_flush (str, optional): The data to flush. If None, flushes the current buffer.
@@ -271,7 +301,7 @@ class Stream(io.IOBase):
         if not data_to_flush:
             return
 
-        self.cache_buffer += data_to_flush
+        end = self._record(data_to_flush)
 
         if self._hook_key in ("stdout_hook", "stderr_hook") and SILENT_STDIO.get():
             return
@@ -283,7 +313,6 @@ class Stream(io.IOBase):
                 # Any newline ends the current terminal line; don't carry a pending prompt over it.
                 PENDING_STDIN_PROMPT.set(False)
 
-        hook = None
         hooks = getattr(self._shell, "hooks", None)
         if not isinstance(hooks, dict):
             raise TypeError("shell.hooks must be a dict")
@@ -293,25 +322,44 @@ class Stream(io.IOBase):
         if hook is None:
             return
 
-        ctx = RUN_CONTEXT.get()
-        invoke = getattr(self._shell, "_invoke_hook", None)
-
-        if asyncio.iscoroutinefunction(hook):
-            # Async hook: call directly (bypassing _invoke_hook which is sync-only)
-            # and schedule the coroutine on the event loop.
-            # Shell.arun() stores the caller's loop on shell._arun_loop before
-            # offloading to a thread — pick it up here for cross-thread scheduling.
-            arun_loop = getattr(self._shell, "_arun_loop", None)
-            effective_loop = arun_loop or getattr(self, "_loop", None)
-            coro = hook(data_to_flush, self.cache_buffer, ctx)
-            _fire_async_hook(coro, loop=effective_loop)
+        if inspect.iscoroutinefunction(hook) or inspect.iscoroutinefunction(getattr(hook, "__call__", None)):
+            if self.async_hooks is None:
+                raise TypeError("Async stream hooks require Shell.arun() or async with Collector")
+            self.async_hooks.submit(hook, data_to_flush, self, end)
         else:
-            # Sync hook: go through _invoke_hook when available (preserves shell
-            # instrumentation such as Streamlit ctx injection), otherwise call directly.
-            if callable(invoke):
-                invoke(hook, data_to_flush, self.cache_buffer, ctx=ctx)
-            else:
-                hook(data_to_flush, self.cache_buffer, ctx)
+            # Hook output belongs to the host, not recursively to this capture.
+            token = CAPTURE_STREAMS.set(None)
+            try:
+                if hook in (stdout_write, stderr_write) and self._delegate is not None:
+                    delegate = self._delegate
+                    while isinstance(delegate, StdIOProxy):
+                        delegate = delegate._delegate
+                    delegate.write(data_to_flush)
+                    delegate.flush()
+                else:
+                    call_sync_hook(hook, data_to_flush, self._snapshot(end))
+            finally:
+                CAPTURE_STREAMS.reset(token)
+
+    def _record(self, data):
+        """Capture in each enclosing run, but deliver hooks only once."""
+        with self._cache_lock:
+            self._cache.seek(0, io.SEEK_END)
+            self._cache.write(data)
+            end = self._cache.tell()
+        if self._capture_parent is not None:
+            self._capture_parent._record(data)
+        return end
+
+    def _snapshot(self, end=None) -> str:
+        with self._cache_lock:
+            self._cache.seek(0)
+            return self._cache.read(end)
+
+    @property
+    def cache_buffer(self) -> str:
+        """Captured output so far (materialized only on demand)."""
+        return self._snapshot()
 
     def get_value(self) -> str:
         """
@@ -335,7 +383,7 @@ class StdinProxy(io.TextIOBase):
         self,
         shell: object,
         *,
-        default_hook: Callable[[object], str],
+        default_hook: Callable[[], str],
         encoding: str = "utf-8",
     ) -> None:
         super().__init__()
@@ -380,12 +428,7 @@ class StdinProxy(io.TextIOBase):
         if hook is not None and not callable(hook):
             raise TypeError("stdin_hook must be callable")
 
-        ctx = RUN_CONTEXT.get()
-        invoke = getattr(self._shell, "_invoke_hook", None)
-        if callable(invoke):
-            chunk = invoke(hook, ctx=ctx)
-        else:
-            chunk = hook(ctx)
+        chunk = call_sync_hook(hook)
 
         if chunk is None:
             self._eof = True
@@ -538,3 +581,51 @@ def install_stdio_proxy() -> None:
         sys.stdout = StdIOProxy(sys.stdout, which="stdout")
     if not isinstance(sys.stderr, StdIOProxy):
         sys.stderr = StdIOProxy(sys.stderr, which="stderr")
+
+
+class StdinRoutingProxy:
+    """Route synchronous reads to the current task's stdin provider."""
+
+    def __init__(self, delegate):
+        self._delegate = delegate
+
+    def __getattr__(self, name):
+        return getattr(CAPTURE_STDIN.get() or self._delegate, name)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        line = self.readline()
+        if not line:
+            raise StopIteration
+        return line
+
+
+_capture_lock = threading.Lock()
+_capture_depth = 0
+_capture_saved = None
+
+
+@contextmanager
+def capture_stdio(stdout, stderr, stdin):
+    """Share scoped routing proxies across overlapping captures, restoring exactly."""
+    global _capture_depth, _capture_saved
+    with _capture_lock:
+        if not _capture_depth:
+            _capture_saved = sys.stdout, sys.stderr, sys.stdin
+            install_stdio_proxy()
+            sys.stdin = StdinRoutingProxy(sys.stdin)
+        _capture_depth += 1
+    output_token = CAPTURE_STREAMS.set((stdout, stderr))
+    input_token = CAPTURE_STDIN.set(stdin)
+    try:
+        yield
+    finally:
+        CAPTURE_STDIN.reset(input_token)
+        CAPTURE_STREAMS.reset(output_token)
+        with _capture_lock:
+            _capture_depth -= 1
+            if not _capture_depth:
+                sys.stdout, sys.stderr, sys.stdin = _capture_saved
+                _capture_saved = None

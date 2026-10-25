@@ -25,17 +25,17 @@ Hook Matrix
 The `Shell` class exposes hooks to customize every stage of execution. Each hook
 receives rich context so embedders can log, transform or short-circuit behaviour:
 
-- `input_hook(code, ctx)` runs before parsing the source string (logging, metrics).
-- `pre_run_hook(code, ctx)` lets you rewrite code before it is tokenized/executed.
-- `code_block_hook(code_block, ctx)` fires for every AST block (useful for tracing).
-- `pre_execute_hook(node, source, ctx)` can mutate AST nodes prior to compilation.
-- `post_execute_hook(node, result, ctx)` observes results or exceptions per node.
-- `display_hook(result, kwargs, ctx)` overrides how expression values are rendered. kwargs is a dict of any extra args passed to `Shell.display()`.
-- `stdout_hook(data, buffer, ctx)` / `stderr_hook(data, buffer, ctx)` redirect output streams to custom handlers.
-- `stdin_hook(ctx)` redirect stdin reads to a custom handler (web, CLI, agents).
-- `exception_hook(exc, ctx)` is invoked once a run finishes with an error.
-- `namespace_change_hook(old, new, locals, ctx)` inspects or vetoes namespace diffs.
-- `post_run_hook(response, ctx)` sees the aggregate `ShellResponse` for logging or
+- `input_hook(code)` runs before parsing the source string (logging, metrics).
+- `pre_run_hook(code)` lets you rewrite code before it is tokenized/executed.
+- `code_block_hook(code_block)` fires for every AST block (useful for tracing).
+- `pre_execute_hook(node, source)` can mutate AST nodes prior to compilation.
+- `post_execute_hook(node, result)` observes successfully executed nodes.
+- `display_hook(result, kwargs)` overrides how expression values are rendered. kwargs is a dict of any extra args passed to `Shell.display()`.
+- `stdout_hook(data, buffer)` / `stderr_hook(data, buffer)` redirect output streams to custom handlers.
+- `stdin_hook()` redirect stdin reads to a custom handler (web, CLI, agents).
+- `exception_hook(exc)` is invoked once a run finishes with an error.
+- `namespace_change_hook(old, new, locals)` observes namespace changes.
+- `post_run_hook(response)` sees the aggregate `ShellResponse` for logging or
   telemetry.
 
 Hooks can be combined; each is optional and falls back to a sensible default when
@@ -64,16 +64,24 @@ import sys
 import builtins
 import ast
 import asyncio
-import concurrent.futures
+import inspect
 import contextvars
+import threading
+from contextlib import contextmanager
+from types import SimpleNamespace, CodeType
+from weakref import WeakSet
+from dataclasses import replace
 import os
 
 from collections import OrderedDict
 from asttokens import ASTTokens
-import subprocess
+import io
 
 from typing import Any, Callable, Optional, Union, Literal
-from .utils import Thread, short_id
+from .utils import short_id, call_sync_hook
+from .processes import run_streamed
+from .sources import SourceCache
+from .scripts import read_script
 from .ptk import prompt
 from .collector import Collector
 from .magics import MagicParser, Magic
@@ -81,7 +89,43 @@ from . import namespace_utils
 from . import traceback_utils
 from . import future_utils
 from . import user_config
-from .context import CAPTURE_STREAMS, RUN_CONTEXT, RunContext, SILENT_STDIO, PENDING_STDIN_PROMPT
+from .context import RUN_CONTEXT, RunContext, SILENT_STDIO, PENDING_STDIN_PROMPT
+
+
+_cwd_lock = threading.Lock()
+_active_executions = {}
+
+
+def _execution_owner():
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    return threading.get_ident(), task
+
+
+@contextmanager
+def _cwd_execution_scope(exclusive):
+    # cwd is process-global. Refuse unsafe overlap rather than blocking an event
+    # loop or claiming os.chdir can be isolated. Inline nested runs remain valid.
+    owner = _execution_owner()
+    with _cwd_lock:
+        others = [value for key, value in _active_executions.items() if key != owner]
+        if others and (exclusive or any(value[1] for value in others)):
+            raise RuntimeError(
+                "Concurrent execution requires use_internal_cwd=False and no cwd argument"
+            )
+        counts = _active_executions.setdefault(owner, [0, 0])
+        counts[0] += 1
+        counts[1] += int(exclusive)
+    try:
+        yield
+    finally:
+        with _cwd_lock:
+            counts[0] -= 1
+            counts[1] -= int(exclusive)
+            if not counts[0]:
+                del _active_executions[owner]
 
 
 class ShellResponse:
@@ -156,9 +200,9 @@ class Shell:
         silent (bool): Default silent mode for runs. If True, suppress stdout/stderr hook
             calls by default while still capturing output. Per-call ``run(..., silent=...)``
             overrides this default.
-        use_internal_cwd (bool): If True (default), keep a shell-local working
-            directory and restore the caller process cwd after each run. If False,
-            use and mutate the ambient process cwd directly.
+        use_internal_cwd (bool): False by default: share the ambient process cwd
+            without implicit chdir. If True, temporarily apply a saved shell cwd
+            and restore the caller cwd; this mode requires exclusive execution.
 
         Hooks:
             Hooks are stored in ``self.hooks`` (a dict) and are passed to ``Shell(...)`` as keyword
@@ -185,24 +229,24 @@ class Shell:
         display(obj): Default method to display an object.
 
     Expected hooks signatures:
-        Hooks receive a final `ctx` argument (RunContext), where `ctx.name` matches the
-        synthetic/custom filename used for the current run (or any custom routing name).
-        This routing context enables advanced late redirection and custom dynamic routing.
+        Hooks receive only their payload. Use ``pynteract.get_run_ctx()`` when
+        routing is needed: its ``name`` matches the current run filename.
+        Outside execution it returns ``None``.
 
-        input_hook(code, ctx)
-        pre_run_hook(code, ctx) -> processed_code
-        code_block_hook(code_block, ctx)
-        pre_execute_hook(node, source, ctx) -> node
-        post_execute_hook(node, result, ctx)
-        display_hook(result, kwargs, ctx)
-        stdout_hook(data, buffer, ctx)
-        stderr_hook(data, buffer, ctx)
-        stdin_hook(ctx) -> str or None
-        exception_hook(exc, ctx)
-        namespace_change_hook(old_globals, new_globals, locals, ctx)
-        post_run_hook(response, ctx) -> response
-        add_script_run_ctx_hook(thread, ctx)
-        get_script_run_ctx_hook(ctx) -> ctx
+        input_hook(code)
+        pre_run_hook(code) -> processed_code
+        code_block_hook(code_block)
+        pre_execute_hook(node, source) -> node
+        post_execute_hook(node, result)
+        display_hook(result, kwargs)
+        stdout_hook(data, buffer)
+        stderr_hook(data, buffer)
+        stdin_hook() -> str or None
+        exception_hook(exc)
+        namespace_change_hook(old_globals, new_globals, locals)
+        post_run_hook(response) -> response
+        add_script_run_ctx_hook(thread, script_ctx)
+        get_script_run_ctx_hook() -> script_ctx
         
     """
 
@@ -215,7 +259,7 @@ class Shell:
         display_mode: Literal['all', 'last', 'none'] = 'last',
         history_size: int = 200,
         silent: bool = False,
-        use_internal_cwd: bool = True,
+        use_internal_cwd: bool = False,
         # Hooks (passed by name via **hooks; see docs above for supported keys)
         **hooks: Any,
     ) -> None:
@@ -227,6 +271,10 @@ class Shell:
             invalid_text = ", ".join(sorted(invalid))
             raise TypeError(f"Unknown non-hook kwargs: {invalid_text}")
         self.hooks: dict[str, Any] = dict(hooks)
+        self._execution_lock = threading.RLock()
+        self._execution_owner = None
+        self._execution_depth = 0
+        self._closed = False
 
         # Execution environment:
         # - Use a module-backed namespace by default so classes/functions get a sane __module__,
@@ -249,6 +297,9 @@ class Shell:
         # Important: we always compile with dont_inherit=True so we never leak the host module's
         # future imports (e.g. from __future__ import annotations) into user code accidentally.
         self._futures = future_utils.FutureManager()
+        # Identify cell frames without filenames or retaining dead compiled cells.
+        self._cell_codes = WeakSet()
+        self._sources = SourceCache()
 
         self.display_mode = display_mode
         self.silent = bool(silent)
@@ -269,6 +320,35 @@ class Shell:
         self._startup_has_source = False
         self._startup_failed = False
         self._startup_error_message = ""
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def close(self) -> None:
+        """Release owned module registrations without clearing user data.
+
+        Idempotent, but not allowed during a cell (including from its hooks).
+        A closed shell cannot execute or structurally mutate its namespace.
+        """
+        with self._execution_lock:
+            if self._execution_depth:
+                raise RuntimeError("Cannot close a Shell while it is executing")
+            if not self._closed:
+                self._ns.close()
+                self._sources.close()
+                self._closed = True
+
+    def __enter__(self):
+        self._check_open()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+    def _check_open(self):
+        if self._closed:
+            raise RuntimeError("This Shell is closed")
 
     def restart_session(self, *, rerun_startup: bool = True, announce: bool = True) -> int:
         """Reset the user namespace and (optionally) rerun the startup script.
@@ -320,9 +400,6 @@ class Shell:
             ctx.run(RUN_CONTEXT.set, RunContext(name=str(name)))
         return ctx
 
-    def _invoke_hook(self, hook: Any, *args: Any, ctx: Any = None) -> Any:
-        return hook(*args, ctx)
-
     @property
     def namespace(self) -> dict[str, Any]:
         """Module-backed execution namespace (canonical)."""
@@ -368,6 +445,8 @@ class Shell:
             current_filename=self._current_filename,
             current_code=self._current_code,
             history=self.history,
+            cell_codes=self._cell_codes,
+            source_names=self._sources.names,
         )
 
 
@@ -412,115 +491,59 @@ class Shell:
         except OSError:
             self.cwd = fallback
 
+    def _run_process(self, command, *, shell=False, stdout=None):
+        prepare_thread = None
+        add_hook = self.hooks.get("add_script_run_ctx_hook")
+        if add_hook:
+            get_hook = self.hooks.get("get_script_run_ctx_hook")
+            ctx = call_sync_hook(get_hook) if get_hook else None
+            prepare_thread = lambda thread: call_sync_hook(add_hook, thread, ctx)
+        return run_streamed(command, shell=shell, stdout=stdout, prepare_thread=prepare_thread)
+
     def run_system_cmd(self, command):
-        """Runs a system command using subprocess.
-        Args:
-            command (str): The system command to run.
-        Returns:
-            int: The return code of the command.
-        """
-        def _stream_output(stream, out_stream):
-            for line in iter(stream.readline, ''):
-                out_stream.write(line)
-                out_stream.flush()
-            stream.close()
-
-        process = subprocess.Popen(
-            command, shell=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, bufsize=1
-        )
-
-        t_out = Thread(target=_stream_output, args=(process.stdout, sys.stdout))
-        t_err = Thread(target=_stream_output, args=(process.stderr, sys.stderr))
-        add_script_run_ctx_hook = self.hooks.get("add_script_run_ctx_hook")
-        if add_script_run_ctx_hook:
-            get_script_run_ctx_hook = self.hooks.get("get_script_run_ctx_hook")
-            run_ctx = RUN_CONTEXT.get()
-            ctx_val = None
-            if get_script_run_ctx_hook:
-                ctx_val = self._invoke_hook(get_script_run_ctx_hook, ctx=run_ctx)
-            self._invoke_hook(add_script_run_ctx_hook, t_out, ctx_val, ctx=run_ctx)
-            self._invoke_hook(add_script_run_ctx_hook, t_err, ctx_val, ctx=run_ctx)
-        t_out.start()
-        t_err.start()
-        t_out.join()
-        t_err.join()
-
-        return process.wait()
+        """Run a blocking system command, streaming IO and propagating delivery errors."""
+        return self._run_process(command, shell=True)
 
     def run_system_cmd_capture(self, command: str) -> str:
-        """Runs a system command and returns its stdout (IPython-like `!!`).
-
-        Stderr is streamed to the current sys.stderr so it is still visible/captured.
-        """
-        completed = subprocess.run(
-            command,
-            shell=True,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        if completed.stderr:
-            sys.stderr.write(completed.stderr)
-            sys.stderr.flush()
-        return completed.stdout
+        """Return stdout (``!!``), streaming stderr; failures still clean up the child."""
+        output = io.StringIO()
+        self._run_process(command, shell=True, stdout=output)
+        return output.getvalue()
 
 
-    def _execute_node(self, node, source, globals, locals, suppress_result=False, is_last_node=False):
-        """
-        Execute a single AST node in the given namespace.
-
-        Args:
-            node (ast.AST): The AST node to execute.
-            source (ASTTokens): The source tokens.
-            globals (dict): The global namespace.
-            locals (dict): The local namespace.
-            suppress_result (bool): Whether to suppress the result display.
-            is_last_node (bool): Whether this is the last node in the current execution.
-
-        Returns:
-            tuple: Updated (globals, locals) after execution.
-
-        This method is responsible for the actual execution of individual AST nodes.
-        It handles both expression and statement nodes, and manages result capturing and display.
-        """
-
-        pre_execute_hook = self.hooks.get("pre_execute_hook")
-        if pre_execute_hook:
-            node = self._invoke_hook(pre_execute_hook, node, source, ctx=RUN_CONTEXT.get())
+    def _compile_node(self, node, source, *, allow_await=False):
+        hook = self.hooks.get("pre_execute_hook")
+        if hook:
+            node = call_sync_hook(hook, node, source)
             if not isinstance(node, ast.AST):
                 raise TypeError("pre_execute_hook must return an AST node")
-        
-        if isinstance(node, ast.Expr):
-            compiled_code = compile(
-                ast.Expression(node.value),
-                filename=self._current_filename,
-                mode="eval",
-                flags=self._futures.flags,
-                dont_inherit=True,
-            )
-            result = eval(compiled_code, globals,locals)
-            self.last_result=result
-            if not suppress_result:
-                if self.display_mode == 'all' or (self.display_mode == 'last' and is_last_node):
-                    self.display(result)
-        else:
-            self.last_result=None
-            compiled_code = compile(
-                ast.Module([node], type_ignores=[]),
-                filename=self._current_filename,
-                mode="exec",
-                flags=self._futures.flags,
-                dont_inherit=True,
-            )
-            exec(compiled_code, globals,locals)
+        expression = isinstance(node, ast.Expr)
+        if not expression:
+            self.last_result = None
+        tree = ast.Expression(node.value) if expression else ast.Module([node], type_ignores=[])
+        compiled = compile(
+            tree, filename=source._pynteract_filename,
+            mode="eval" if expression else "exec",
+            flags=self._futures.flags | (ast.PyCF_ALLOW_TOP_LEVEL_AWAIT if allow_await else 0),
+            dont_inherit=True,
+        )
+        self._register_cell_code(compiled)
+        return node, compiled, expression
 
-        post_execute_hook = self.hooks.get("post_execute_hook")
-        if post_execute_hook:
-            self._invoke_hook(post_execute_hook, node, self.last_result, ctx=RUN_CONTEXT.get())
+    def _register_cell_code(self, code):
+        self._cell_codes.add(code)
+        for constant in code.co_consts:
+            if isinstance(constant, CodeType):
+                self._register_cell_code(constant)
 
-        return globals,locals
+    def _finish_node(self, node, result, expression, suppress_result, is_last_node):
+        self.last_result = result if expression else None
+        if expression and not suppress_result:
+            if self.display_mode == 'all' or (self.display_mode == 'last' and is_last_node):
+                self.display(result)
+        hook = self.hooks.get("post_execute_hook")
+        if hook:
+            call_sync_hook(hook, node, self.last_result)
 
     def _select_exec_context(self, globals_dict, locals_dict):
         """Return (exec_globals, exec_locals, is_session_namespace)."""
@@ -544,12 +567,20 @@ class Shell:
             self._current_filename = f"<shell-input-{self._input_counter}>"
         return self._current_filename
 
-    def _execute_source(self, processed_code: str, *, filename: str, exec_globals: dict, exec_locals):
+    def _iter_nodes(self, processed_code: str, *, filename: str, allow_await=False):
         source = ASTTokens(processed_code, parse=True, filename=filename)
         nodes = source.tree.body
-        self._futures.begin_block()
+        # Validate the entire cell before any node can produce side effects.
+        # Future flags are committed only after successful validation.
+        futures = replace(self._futures)
+        futures.begin_block()
+        for node in nodes:
+            futures.process_node(node)
+        compile(source.tree, filename, "exec", dont_inherit=True,
+                flags=futures.flags | (ast.PyCF_ALLOW_TOP_LEVEL_AWAIT if allow_await else 0))
+        self._futures = futures
+        source._pynteract_filename = self._sources.register(filename, processed_code)
         for i, node in enumerate(nodes):
-            self._futures.process_node(node)
 
             next_token = source.next_token(node.last_token)
             suppress_result = bool(next_token and next_token.string == ';')
@@ -561,13 +592,125 @@ class Shell:
 
             code_block_hook = self.hooks.get("code_block_hook")
             if code_block_hook:
-                self._invoke_hook(code_block_hook, code_block, ctx=RUN_CONTEXT.get())
+                call_sync_hook(code_block_hook, code_block)
 
-            exec_globals, exec_locals = self._execute_node(
-                node, source, exec_globals, exec_locals, suppress_result, is_last_node
-            )
+            yield node, source, suppress_result, is_last_node
 
-        return exec_globals, exec_locals
+    @contextmanager
+    def _namespace_mutation_scope(self):
+        with self._execution_lock:
+            self._check_open()
+            if self._execution_depth and self._execution_owner != _execution_owner():
+                raise RuntimeError("Cannot mutate the namespace while this Shell is executing")
+            yield
+
+    @contextmanager
+    def _execution_scope(self, cwd):
+        owner = _execution_owner()
+        with self._execution_lock:
+            self._check_open()
+            if self._execution_depth and self._execution_owner != owner:
+                raise RuntimeError("This Shell is already executing a cell")
+            self._execution_owner = owner
+            self._execution_depth += 1
+        nested = self._execution_depth > 1
+        previous = self._current_filename, self._current_code, self.last_result
+        try:
+            with _cwd_execution_scope(self.use_internal_cwd or cwd is not None):
+                yield
+        finally:
+            if nested:
+                self._current_filename, self._current_code, self.last_result = previous
+                self._ns.set_current_filename(self._current_filename)
+            with self._execution_lock:
+                self._execution_depth -= 1
+                if not self._execution_depth:
+                    self._execution_owner = None
+
+    @contextmanager
+    def _run_scope(self, code, globals, locals, silent, filename, cwd):
+        previous_process_cwd = os.path.abspath(os.getcwd())
+        run_cwd = self._normalize_cwd(cwd)
+        if self.use_internal_cwd or cwd is not None:
+            os.chdir(run_cwd)
+        filename = self._next_filename(filename)
+        token_ctx = RUN_CONTEXT.set(RunContext(name=filename))
+        run_silent = self.silent if silent is None else bool(silent)
+        token_silent = SILENT_STDIO.set(run_silent)
+        token_prompt = PENDING_STDIN_PROMPT.set(False)
+        original_code = code
+        try:
+            input_hook = self.hooks.get("input_hook")
+            if input_hook:
+                call_sync_hook(input_hook, code)
+
+            exec_globals, exec_locals, is_session_namespace = self._select_exec_context(globals, locals)
+
+            with self._magic_parser._placeholder_scope():
+                code = self._magic_parser._parse_system_cmd(code)
+                code = self._magic_parser._parse_magics(code)
+
+                pre_run_hook = self.hooks.get("pre_run_hook")
+                if pre_run_hook:
+                    processed_code = call_sync_hook(pre_run_hook, code)
+                else:
+                    processed_code = code
+
+                if is_session_namespace:
+                    self._ns.set_current_filename(self._current_filename)
+                self._ns.bind_namespace(
+                    exec_globals,
+                    filename=filename,
+                    module_name=self._ns.module_name if is_session_namespace else None,
+                )
+
+                self._current_code = processed_code
+                old_globals = dict(exec_globals)
+                self.last_result = None
+
+                state = SimpleNamespace(
+                    code=processed_code, filename=filename,
+                    globals=exec_globals, locals=exec_locals, collector=Collector(self),
+                    response=None,
+                )
+                yield state
+                collector = state.collector
+
+                namespace_change_hook = self.hooks.get("namespace_change_hook")
+                if namespace_change_hook:
+                    call_sync_hook(namespace_change_hook, old_globals, exec_globals, exec_locals)
+
+                if "__" in exec_globals:
+                    exec_globals["___"] = exec_globals["__"]
+                if "_" in exec_globals:
+                    exec_globals["__"] = exec_globals["_"]
+                exec_globals["_"] = self.last_result
+
+                response = ShellResponse(
+                    input=original_code,
+                    processed_input=processed_code,
+                    stdout=collector.get_stdout(),
+                    stderr=collector.get_stderr(),
+                    result=self.last_result,
+                    exception=collector.exception,
+                )
+
+                post_run_hook = self.hooks.get("post_run_hook")
+                if post_run_hook:
+                    response = call_sync_hook(post_run_hook, response)
+
+                self.add_to_history(filename, response)
+                state.response = response
+        finally:
+            try:
+                if self.use_internal_cwd:
+                    self._finalize_cwd(run_cwd)
+                    os.chdir(previous_process_cwd)
+            finally:
+                PENDING_STDIN_PROMPT.reset(token_prompt)
+                SILENT_STDIO.reset(token_silent)
+                RUN_CONTEXT.reset(token_ctx)
+
 
     def run(self, code, globals=None, locals=None, silent=None, filename=None, cwd=None):
         """
@@ -587,146 +730,33 @@ class Shell:
         Returns:
             ShellResponse: An object containing the results of the execution.
         """
-        previous_process_cwd = os.path.abspath(os.getcwd())
-        run_cwd = self._normalize_cwd(cwd)
-        if self.use_internal_cwd or cwd is not None:
-            os.chdir(run_cwd)
-        filename = self._next_filename(filename)
-        token_ctx = RUN_CONTEXT.set(RunContext(name=filename))
-        run_silent = self.silent if silent is None else bool(silent)
-        token_silent = SILENT_STDIO.set(run_silent)
-        token_prompt = PENDING_STDIN_PROMPT.set(False)
-        try:
-            input_hook = self.hooks.get("input_hook")
-            if input_hook:
-                self._invoke_hook(input_hook, code, ctx=RUN_CONTEXT.get())
-
-            exec_globals, exec_locals, is_session_namespace = self._select_exec_context(globals, locals)
-
-            with self._magic_parser._placeholder_scope():
-                code = self._magic_parser._parse_system_cmd(code)
-                code = self._magic_parser._parse_magics(code)
-
-                pre_run_hook = self.hooks.get("pre_run_hook")
-                if pre_run_hook:
-                    processed_code = self._invoke_hook(pre_run_hook, code, ctx=RUN_CONTEXT.get())
-                else:
-                    processed_code = code
-
-                if is_session_namespace:
-                    self._ns.set_current_filename(self._current_filename)
-                namespace_utils.NamespaceManager.prepare_namespace(
-                    exec_globals,
-                    filename=filename,
-                    module_name=self._ns.module_name if is_session_namespace else None,
-                )
-
-                self._current_code = processed_code
-                old_globals = dict(exec_globals)
-                self.last_result = None
-
-                collector = Collector(self)
-                with collector:
-                    token_capture = CAPTURE_STREAMS.set((collector.stdout_stream, collector.stderr_stream))
-                    try:
-                        exec_globals, exec_locals = self._execute_source(
-                            processed_code, filename=filename, exec_globals=exec_globals, exec_locals=exec_locals
-                        )
-                    except:
-                        raise
-                    finally:
-                        CAPTURE_STREAMS.reset(token_capture)
-
-                namespace_change_hook = self.hooks.get("namespace_change_hook")
-                if namespace_change_hook:
-                    self._invoke_hook(namespace_change_hook, old_globals, exec_globals, exec_locals, ctx=RUN_CONTEXT.get())
-
-                if "__" in exec_globals:
-                    exec_globals["___"] = exec_globals["__"]
-                if "_" in exec_globals:
-                    exec_globals["__"] = exec_globals["_"]
-                exec_globals["_"] = self.last_result
-
-                response = ShellResponse(
-                    input=code,
-                    processed_input=processed_code,
-                    stdout=collector.get_stdout(),
-                    stderr=collector.get_stderr(),
-                    result=self.last_result,
-                    exception=collector.exception,
-                )
-
-                post_run_hook = self.hooks.get("post_run_hook")
-                if post_run_hook:
-                    response = self._invoke_hook(post_run_hook, response, ctx=RUN_CONTEXT.get())
-
-                self.add_to_history(filename, response)
-                return response
-        finally:
-            if self.use_internal_cwd:
-                self._finalize_cwd(run_cwd)
-                os.chdir(previous_process_cwd)
-            PENDING_STDIN_PROMPT.reset(token_prompt)
-            SILENT_STDIO.reset(token_silent)
-            RUN_CONTEXT.reset(token_ctx)
-    
+        with self._execution_scope(cwd), self._run_scope(code, globals, locals, silent, filename, cwd) as state:
+            with state.collector:
+                for node, source, suppressed, last in self._iter_nodes(state.code, filename=state.filename):
+                    node, compiled, expression = self._compile_node(node, source)
+                    result = eval(compiled, state.globals, state.locals)
+                    self._finish_node(node, result, expression, suppressed, last)
+        return state.response
 
     async def arun(self, code, globals=None, locals=None, silent=None, filename=None, cwd=None):
-        """Execute *code* asynchronously without blocking the running event loop.
+        """Execute in the caller's task, supporting top-level await/async for/async with.
 
-        ``arun`` is the async counterpart of :meth:`run`.  It offloads the
-        synchronous execution to a :class:`~concurrent.futures.ThreadPoolExecutor`
-        so that the caller's event loop remains responsive during long-running
-        cells.  ``contextvars`` are propagated automatically via
-        :func:`contextvars.copy_context`, which means that ``RUN_CONTEXT``,
-        ``SILENT_STDIO`` and ``CAPTURE_STREAMS`` all behave exactly as they
-        would in a plain ``run()`` call.
-
-        Async hooks registered on ``stdout_hook`` / ``stderr_hook`` are
-        scheduled on *this* event loop by :func:`~pynteract.streams._fire_async_hook`
-        as each chunk is flushed — there is no extra wiring required here.
-
-        Args:
-            code (str): The Python code to execute.
-            globals (dict, optional): Global namespace to use. If None, uses self.namespace.
-            locals (dict, optional): Local namespace to use. If None, globals will be used.
-            silent (bool, optional): If provided, overrides the shell's default silent mode for this run.
-            filename (str, optional): Custom filename used in tracebacks/history.
-            cwd (str or os.PathLike, optional): Working directory for this run; follows
-                the same internal-vs-ambient cwd semantics as ``run()``.
-
-        Returns:
-            ShellResponse: An object containing the results of the execution.
-
-        Example::
-
-            shell = Shell()
-            async def main():
-                response = await shell.arun("1 + 1")
-                print(response.result)  # 2
-            asyncio.run(main())
+        Synchronous code and hooks remain synchronous: blocking work blocks the
+        event loop. Use ``await asyncio.to_thread(shell.run, code)`` explicitly
+        for blocking cells. Ordinary expression results are not auto-awaited.
+        Async stdout/stderr hooks are drained before return; other hooks are sync.
+        Concurrent cells require separate shells with ``use_internal_cwd=False``
+        and no explicit ``cwd``. Process cwd mutations are never task-local.
         """
-        ctx = contextvars.copy_context()
-        loop = asyncio.get_running_loop()
-
-        def _run_and_inject():
-            # Inject the caller's event loop into every Stream the Collector
-            # will create so that async hooks can schedule back onto it.
-            for attr in ("stdout_hook", "stderr_hook"):
-                # Streams are created fresh per run(); we propagate via a
-                # temporary shell attribute that Collector/Stream can read.
-                pass
-            # Patch: store loop on shell so Stream instances created during
-            # this run() can find it via self._shell._arun_loop.
-            self._arun_loop = loop
-            try:
-                return ctx.run(self.run, code, globals, locals, silent, filename, cwd)
-            finally:
-                self._arun_loop = None
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            response = await loop.run_in_executor(pool, _run_and_inject)
-        return response
+        with self._execution_scope(cwd), self._run_scope(code, globals, locals, silent, filename, cwd) as state:
+            async with state.collector:
+                for node, source, suppressed, last in self._iter_nodes(state.code, filename=state.filename, allow_await=True):
+                    node, compiled, expression = self._compile_node(node, source, allow_await=True)
+                    result = eval(compiled, state.globals, state.locals)
+                    if compiled.co_flags & inspect.CO_COROUTINE:
+                        result = await result
+                    self._finish_node(node, result, expression, suppressed, last)
+        return state.response
 
     def add_to_history(self, filename, response):
         """Add a ``ShellResponse`` to the cache, enforcing the size limit.
@@ -756,12 +786,7 @@ class Shell:
         if obj is not None:
             display_hook = self.hooks.get("display_hook")
             if display_hook:
-                run_ctx = RUN_CONTEXT.get()
-                invoke = getattr(self, "_invoke_hook", None)
-                if callable(invoke):
-                    invoke(display_hook, obj, kwargs, ctx=run_ctx)
-                else:
-                    display_hook(obj, kwargs, run_ctx)
+                call_sync_hook(display_hook, obj, kwargs)
             else:
                 print(repr(obj))
 
@@ -780,24 +805,29 @@ class Shell:
         print("Use Alt+Enter to submit your input.")
         print("Type 'exit()' to exit the shell.")
 
-        loop=True
+        loop = True
 
         def custom_exit():
             nonlocal loop
-            loop=False
+            loop = False
 
         self.update_namespace(exit=custom_exit)
         
         while loop:
             try:
                 code = prompt(">>> ", prompt_continuation="... ", highlighting="python")
-                self.run(code)
             except KeyboardInterrupt:
                 print("\nKeyboardInterrupt")
             except EOFError:
                 break
-            except Exception as e:
-                print(f"An error occurred: {e}")
+            except Exception as exc:
+                print(f"pynteract: terminal input failed: {exc}", file=sys.stderr)
+                return 1
+            else:
+                try:
+                    self.run(code)
+                except KeyboardInterrupt:
+                    print("\nKeyboardInterrupt")
 
         print("Exiting interactive shell.")
         return 0
@@ -810,21 +840,21 @@ class Shell:
         if self._startup_ran:
             if announce and self._startup_has_source and not self._startup_announced:
                 print("Running startup...")
+                self._startup_announced = True
                 if self._startup_failed:
                     sys.stderr.write(self._startup_error_message.rstrip() + "\n")
                     return 1
                 print("Ready!")
-                self._startup_announced = True
             return 0 if not self._startup_failed else 1
 
-        path = user_config.startup_path()
         self._startup_ran = True
-
+        path = "startup configuration"
         try:
+            path = user_config.startup_path()
             if not path.exists():
                 return 0
-            code = path.read_text(encoding="utf-8", errors="replace")
-        except Exception as exc:
+            code = read_script(path)
+        except (OSError, UnicodeError, SyntaxError) as exc:
             # Startup is optional; failure to read should not prevent interactive mode.
             sys.stderr.write(f"pynteract: could not read startup file: {path} ({exc})\n")
             return 0
@@ -835,12 +865,12 @@ class Shell:
         self._startup_has_source = True
         if announce:
             print("Running startup...")
+            self._startup_announced = True
 
         response = self.run(code, silent=True, filename=str(path))
         if response.exception is None:
             if announce:
                 print("Ready!")
-                self._startup_announced = True
             return 0
 
         self._startup_failed = True
@@ -885,13 +915,14 @@ class Shell:
         This method is useful for resetting the shell to its initial state,
         clearing all user-defined variables and functions while keeping builtins.
         """
-        # Namespace reset is handled by the namespace manager.
-        self._ns.reset_module_namespace()
+        with self._namespace_mutation_scope():
+            # Namespace reset is handled by the namespace manager.
+            self._ns.reset_module_namespace()
 
-        self.magics = {}
-        self._builtin_magics_registered = False
-        self._futures.reset()
-        self.ensure_builtins()
+            self.magics = {}
+            self._builtin_magics_registered = False
+            self._futures.reset()
+            self.ensure_builtins()
 
     def update_namespace(self, *args, **kwargs):
         """
@@ -904,7 +935,8 @@ class Shell:
         This method allows for real-time modifications to the execution environment,
         adding new variables or functions that will be available in subsequent code executions.
         """
-        self.namespace.update(*args, **kwargs)
+        with self._namespace_mutation_scope():
+            self.namespace.update(*args, **kwargs)
 
     def set_namespace(self, namespace):
         """
@@ -913,11 +945,13 @@ class Shell:
         Args:
             namespace: A dict used as the module namespace (reference preserved).
         """
-        if not isinstance(namespace, dict):
-            raise TypeError("The Shell's namespace must be a dict (reference preserved, module-like semantics).")
-        self._ns.set_namespace(namespace)
-        self.ensure_builtins()
-        return self.namespace
-        
+        with self._namespace_mutation_scope():
+            if not isinstance(namespace, dict):
+                raise TypeError("The Shell's namespace must be a dict (reference preserved, module-like semantics).")
+            self._ns.set_namespace(namespace)
+            self.ensure_builtins()
+            return self.namespace
+
+
 if __name__=='__main__':
     Shell().interact()

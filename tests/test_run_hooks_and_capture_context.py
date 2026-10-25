@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from pynteract import Shell
+from pynteract import Shell, get_run_ctx
 
 
 def test_stdout_hook_receives_run_context_with_filename():
     seen: list[tuple[str, str]] = []
 
-    def hook(data: str, _buffer: str, ctx) -> None:
+    def hook(data: str, _buffer: str) -> None:
+        ctx = get_run_ctx()
         seen.append((ctx.name if ctx else "none", data))
 
     shell = Shell(display_mode="none", stdout_hook=hook)
@@ -20,7 +21,8 @@ def test_stdout_hook_receives_run_context_with_filename():
 def test_capture_context_routes_late_thread_output_to_run_hook():
     seen: list[tuple[str, str]] = []
 
-    def hook(data: str, _buffer: str, ctx) -> None:
+    def hook(data: str, _buffer: str) -> None:
+        ctx = get_run_ctx()
         seen.append((ctx.name if ctx else "none", data))
 
     shell = Shell(display_mode="none", stdout_hook=hook)
@@ -45,7 +47,8 @@ def test_capture_context_routes_late_thread_output_to_run_hook():
 def test_capture_context_can_override_filename_for_routing():
     seen: list[tuple[str, str]] = []
 
-    def hook(data: str, _buffer: str, ctx) -> None:
+    def hook(data: str, _buffer: str) -> None:
+        ctx = get_run_ctx()
         seen.append((ctx.name if ctx else "none", data))
 
     shell = Shell(display_mode="none", stdout_hook=hook)

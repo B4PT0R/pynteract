@@ -21,6 +21,15 @@ RUN_CONTEXT: contextvars.ContextVar[RunContext | None] = contextvars.ContextVar(
     default=None,
 )
 
+def get_run_ctx() -> RunContext | None:
+    """Return the current execution context, or ``None`` outside a run.
+
+    Context follows async tasks and contexts explicitly copied into threads.
+    It is also available inside hooks; no hook argument is needed for routing.
+    """
+    return RUN_CONTEXT.get()
+
+
 # If True, suppress stdout/stderr hook calls for this run (still captures output).
 SILENT_STDIO: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "pynteract_silent_stdio",
@@ -32,4 +41,9 @@ SILENT_STDIO: contextvars.ContextVar[bool] = contextvars.ContextVar(
 PENDING_STDIN_PROMPT: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "pynteract_pending_stdin_prompt",
     default=False,
+)
+
+# Task-local stdin provider used by the scoped process-wide proxy.
+CAPTURE_STDIN: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "pynteract_capture_stdin", default=None,
 )
