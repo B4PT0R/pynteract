@@ -119,6 +119,38 @@ cooperative: it cannot interrupt synchronous blocking code. Child tasks and
 threads created by a cell remain the caller's responsibility; await/join them
 before the cell returns, particularly when using async output hooks.
 
+### Programmatic interruption
+
+`Shell.interrupt()` requests interruption without closing the shell or replacing
+its namespace. It returns `False` when idle. A delivered interruption raises
+`ExecutionInterrupted` (a `BaseException`, not an ordinary cell error) from
+`run()`/`arun()`; catch it in the host, then reuse the same shell. Mutations and
+side effects already performed remain, including object identities.
+
+```python
+from pynteract import ExecutionInterrupted
+
+try:
+    response = await shell.arun(code)
+except ExecutionInterrupted:
+    pass  # The shell and its namespace remain usable.
+```
+
+For an async run, another host task/thread can call `shell.interrupt()`; it
+schedules cancellation on the owning task. External task cancellation still
+propagates as `asyncio.CancelledError`. Synchronous code blocks its event loop;
+to interrupt it, the host must call from its owning thread (for example a
+host-installed Python signal handler). Foreign-thread synchronous interruption
+is rejected rather than injecting unsafe exceptions. The library installs no
+process-wide signal handlers and does not send OS signals itself.
+
+This is cooperative, best-effort interruption, not forced termination: native
+calls can delay it and user code can catch/ignore it. Cleanup follows ordinary
+Python exception/cancellation semantics. Asynchronous signal delivery cannot
+guarantee every user `finally` block (for example tight single-line loops on
+CPython 3.12). Resource-critical hosts should isolate execution in a process and
+provide a separate explicit hard-stop fallback; that fallback loses its memory.
+
 ### Concurrency and process state
 
 A `Shell` has mutable execution state and rejects overlapping runs from different

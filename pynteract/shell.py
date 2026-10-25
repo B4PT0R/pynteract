@@ -128,6 +128,14 @@ def _cwd_execution_scope(exclusive):
                 del _active_executions[owner]
 
 
+class ExecutionInterrupted(BaseException):
+    """An explicit host interruption; unwinds user code without closing its Shell.
+
+    Unlike KeyboardInterrupt this does not trigger asyncio's runner shutdown.
+    Like KeyboardInterrupt it is deliberately not caught by ``except Exception``.
+    """
+
+
 class ShellResponse:
     """
     Represents the results of code execution, encapsulating various aspects of the execution.
@@ -604,6 +612,36 @@ class Shell:
                 raise RuntimeError("Cannot mutate the namespace while this Shell is executing")
             yield
 
+    def interrupt(self):
+        """Interrupt the active cell, returning False if idle.
+
+        For synchronous execution call from the owning thread, typically in a
+        host-installed signal handler. An async run can also be interrupted from
+        another task/thread: its task is cancelled and arun raises
+        ExecutionInterrupted after cleanup. No process-wide signal handlers or
+        unsafe cross-thread exception injection are installed by the library.
+        Native calls may delay delivery; user code can catch/ignore interruption.
+        Namespace mutations already made are retained, not rolled back.
+        """
+        with self._execution_lock:
+            if not self._execution_depth:
+                return False
+            owner_thread, task = self._execution_owner
+            state = self._interrupt_state
+            if owner_thread == threading.get_ident() and task is _execution_owner()[1]:
+                raise ExecutionInterrupted()
+            if task is None:
+                raise RuntimeError("Interrupt synchronous execution from its owning thread")
+            if not state.requested:
+                state.requested = True
+                task.get_loop().call_soon_threadsafe(self._cancel_execution, state, task)
+        return True
+
+    @staticmethod
+    def _cancel_execution(state, task):
+        if state.active and not task.done():
+            state.cancel_sent = task.cancel()
+
     @contextmanager
     def _execution_scope(self, cwd):
         owner = _execution_owner()
@@ -612,19 +650,33 @@ class Shell:
             if self._execution_depth and self._execution_owner != owner:
                 raise RuntimeError("This Shell is already executing a cell")
             self._execution_owner = owner
+            if not self._execution_depth:
+                self._interrupt_state = SimpleNamespace(active=True, requested=False, cancel_sent=False)
             self._execution_depth += 1
+        state = self._interrupt_state
         nested = self._execution_depth > 1
         previous = self._current_filename, self._current_code, self.last_result
         try:
             with _cwd_execution_scope(self.use_internal_cwd or cwd is not None):
                 yield
+        except asyncio.CancelledError:
+            if not nested and state.cancel_sent:
+                # Remove only the cancellation we issued, not an external one.
+                remaining = owner[1].uncancel()
+                state.cancel_sent = False
+                if not remaining:
+                    raise ExecutionInterrupted() from None
+            raise
         finally:
+            if not nested and state.cancel_sent:
+                owner[1].uncancel()  # User code may have suppressed our cancellation.
             if nested:
                 self._current_filename, self._current_code, self.last_result = previous
                 self._ns.set_current_filename(self._current_filename)
             with self._execution_lock:
                 self._execution_depth -= 1
                 if not self._execution_depth:
+                    state.active = False
                     self._execution_owner = None
 
     @contextmanager
