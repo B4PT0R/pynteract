@@ -344,6 +344,26 @@ Context follows async tasks and explicitly copied thread contexts.
 
 ### Async output hooks
 
+Hosts handling untrusted amounts of output can opt into bounded capture:
+
+```python
+shell = Shell(capture_limit=256 * 1024, hook_buffer=False,
+              stdout_hook=lambda chunk, _: consume(chunk))
+```
+
+`capture_limit` is a nonnegative character count **per stream, per run** (default
+`None`, unlimited). Capture and hook delivery retain only this prefix, followed
+once by `[output truncated: capture limit reached]`; execution continues. The
+marker is additional to the limit. `response.output_stats` contains `written_chars`
+(excluding the marker) and `truncated` for stdout/stderr. No tail is retained after
+capture overflow; use a file for complete logs. `hook_buffer=False` passes `""` as
+the hook's second argument rather than materializing cumulative snapshots. It
+avoids quadratic copying for chunk-only consumers, including the default mirrors.
+With a limit, async hook queues retain at most the accepted prefix plus marker;
+slow consumers cannot build an unlimited output backlog. Default unlimited
+capture/cumulative-hook semantics remain unchanged. This bounds library-owned
+capture, not caller-created strings, custom hooks, user threads or process RSS.
+
 Only `stdout_hook` and `stderr_hook` may be async (`async def`, including async
 `__call__` objects), and only with `arun()` or `async with Collector(...)`.
 All other hooks, magics and stdin providers are synchronous; accidental awaitable
@@ -530,6 +550,8 @@ Important public attributes:
 | `cwd` | `str` | Current working directory used by `run()`/`arun()`: shell-local in internal-cwd mode, process cwd in ambient mode. |
 | `last_result` | `Any` | Last expression value. |
 | `silent` | `bool` | Instance default for suppressing stdout/stderr hooks while still capturing output. |
+| `capture_limit` | `int \| None` | Per-stream character limit; `None` keeps all output. |
+| `hook_buffer` | `bool` | Whether hooks receive cumulative text as their second argument. |
 
 ### `ShellResponse`
 
@@ -540,6 +562,7 @@ Returned by `Shell.run(...)` and `await Shell.arun(...)`.
 | `input` | `str` | Original source string. |
 | `processed_input` | `str` | Expanded source (magics/system commands). |
 | `stdout` / `stderr` | `str` | Captured output for the run. |
+| `output_stats` | `dict` | Per-stream `written_chars` and capture `truncated` flag. |
 | `result` | `Any` | Value of the final executed node if it is an expression; otherwise `None`. `display_mode` controls rendering, not this value. |
 | `exception` | `Exception | None` | Exception instance, with enriched traceback attached (when available). |
 

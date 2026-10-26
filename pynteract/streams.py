@@ -11,6 +11,8 @@ from .ptk import prompt
 from .utils import call_sync_hook
 from .context import CAPTURE_STDIN, CAPTURE_STREAMS, SILENT_STDIO, PENDING_STDIN_PROMPT
 
+TRUNCATION_MARKER = "\n[output truncated: capture limit reached]\n"
+
 def stdout_write(data: str, buffer: str) -> None:
     """Default stdout hook that mirrors captured output to the real stdout."""
     if isinstance(sys.stdout, (Stream, StdIOProxy)):
@@ -93,7 +95,7 @@ class AsyncHookQueue:
                 continue
             hook, data, stream, end = item
             try:
-                await hook(data, stream._snapshot(end))
+                await hook(data, stream._hook_snapshot(end))
             except Exception as exc:
                 if self.error is None:
                     self.error = exc
@@ -193,6 +195,9 @@ class Stream(io.IOBase):
         self.buffer_size = buffer_size
         self._pending_buffer = ""
         self._cache = io.StringIO()
+        self._capture_limit = getattr(shell, "capture_limit", None)
+        self._truncated = False
+        self.written_chars = 0
         self._cache_lock = threading.Lock()
         self.async_hooks = None
         self._capture_parent = None
@@ -268,6 +273,16 @@ class Stream(io.IOBase):
         if not isinstance(data, str):
             raise TypeError("write argument must be str, not {}".format(type(data).__name__))
         
+        # Bounded capture must not split a huge write into an unbounded list
+        # of lines or retain its incomplete line. Caller-owned input is not copied.
+        if self._capture_limit is None:
+            self._write_text(data)
+        else:
+            for offset in range(0, len(data), self.buffer_size):
+                self._write_text(data[offset:offset + self.buffer_size])
+        return len(data)
+
+    def _write_text(self, data):
         self._pending_buffer += data
 
         # Process complete lines
@@ -281,8 +296,6 @@ class Stream(io.IOBase):
         # Flush if buffer exceeds size limit
         if len(self._pending_buffer) >= self.buffer_size:
             self.flush()
-
-        return len(data)
 
     def flush(self, data_to_flush=None) -> None:  # type: ignore[override]
         """Flush buffered data through the hook (sync or async).
@@ -301,7 +314,9 @@ class Stream(io.IOBase):
         if not data_to_flush:
             return
 
-        end = self._record(data_to_flush)
+        data_to_flush, end = self._record(data_to_flush)
+        if not data_to_flush:
+            return
 
         if self._hook_key in ("stdout_hook", "stderr_hook") and SILENT_STDIO.get():
             return
@@ -337,19 +352,30 @@ class Stream(io.IOBase):
                     delegate.write(data_to_flush)
                     delegate.flush()
                 else:
-                    call_sync_hook(hook, data_to_flush, self._snapshot(end))
+                    call_sync_hook(hook, data_to_flush, self._hook_snapshot(end))
             finally:
                 CAPTURE_STREAMS.reset(token)
 
     def _record(self, data):
         """Capture in each enclosing run, but deliver hooks only once."""
-        with self._cache_lock:
-            self._cache.seek(0, io.SEEK_END)
-            self._cache.write(data)
-            end = self._cache.tell()
         if self._capture_parent is not None:
             self._capture_parent._record(data)
-        return end
+        with self._cache_lock:
+            self.written_chars += len(data)
+            self._cache.seek(0, io.SEEK_END)
+            if self._capture_limit is not None:
+                if self._truncated:
+                    return "", self._cache.tell()
+                remaining = max(0, self._capture_limit - self._cache.tell())
+                if len(data) > remaining:
+                    data = data[:remaining] + TRUNCATION_MARKER
+                    self._truncated = True
+            self._cache.write(data)
+            return data, self._cache.tell()
+
+    def _hook_snapshot(self, end):
+        # Opt-out for chunk-only consumers; do not materialize cumulative text.
+        return self._snapshot(end) if getattr(self._shell, "hook_buffer", True) else ""
 
     def _snapshot(self, end=None) -> str:
         with self._cache_lock:

@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.0 - Unreleased
+
+- Add opt-in `Shell(capture_limit=...)` per-stream, per-run prefix capture with
+  one visible overflow marker and actual written-character statistics. Bound
+  internal processing of huge writes and slow async hook backlog under this cap.
+- Add `hook_buffer=False` for chunk-only hooks without cumulative text copies.
+  Keep unlimited capture and cumulative hooks as the backwards-compatible defaults.
+- Cover overflow, exact boundaries, slow hooks, memory growth, interruption and
+  namespace reuse; document that capture limits are not a process sandbox.
+
 ## 1.1.0 - 2026-10-26
 
 - Add `Shell.interrupt()` and export `ExecutionInterrupted` for cooperative host

@@ -144,6 +144,7 @@ class ShellResponse:
         input (str): The original input code.
         processed_input (str): The code after preprocessing.
         stdout (str): Captured standard output.
+        output_stats (dict): Per-stream written_chars and truncated flag.
         stderr (str): Captured standard error.
         result (Any): The result of the last executed expression.
         exception (Exception): Any exception that occurred during execution.
@@ -155,7 +156,8 @@ class ShellResponse:
         stdout: Optional[str] = None,
         stderr: Optional[str] = None,
         result: Any = None,
-        exception: Optional[Exception] = None
+        exception: Optional[Exception] = None,
+        output_stats: Optional[dict] = None,
     ) -> None:
         self.input = input
         self.processed_input = processed_input
@@ -163,6 +165,7 @@ class ShellResponse:
         self.stderr = stderr
         self.result = result
         self.exception = exception
+        self.output_stats = output_stats or {}
 
     @staticmethod
     def _short_repr(value: Any, *, limit: int = 100) -> str:
@@ -205,6 +208,11 @@ class Shell:
         namespace (dict): The global namespace for code execution.
         display_mode (str): Controls when results are displayed ('all', 'last', or 'none').
         history_size (int): Maximum number of past executions to cache.
+        capture_limit (int | None): Optional per-stream character limit per run.
+            Keeps a prefix plus a visible marker; subsequent output is discarded
+            from capture and hooks, but counted in response.output_stats.
+        hook_buffer (bool): Pass cumulative text to stream hooks (default True).
+            False passes an empty second argument, avoiding cumulative copies.
         silent (bool): Default silent mode for runs. If True, suppress stdout/stderr hook
             calls by default while still capturing output. Per-call ``run(..., silent=...)``
             overrides this default.
@@ -268,6 +276,8 @@ class Shell:
         history_size: int = 200,
         silent: bool = False,
         use_internal_cwd: bool = False,
+        capture_limit: int | None = None,
+        hook_buffer: bool = True,
         # Hooks (passed by name via **hooks; see docs above for supported keys)
         **hooks: Any,
     ) -> None:
@@ -278,6 +288,10 @@ class Shell:
         if invalid:
             invalid_text = ", ".join(sorted(invalid))
             raise TypeError(f"Unknown non-hook kwargs: {invalid_text}")
+        if capture_limit is not None and (type(capture_limit) is not int or capture_limit < 0):
+            raise ValueError("capture_limit must be a nonnegative integer or None")
+        self.capture_limit = capture_limit
+        self.hook_buffer = bool(hook_buffer)
         self.hooks: dict[str, Any] = dict(hooks)
         self._execution_lock = threading.RLock()
         self._execution_owner = None
@@ -741,6 +755,10 @@ class Shell:
                 response = ShellResponse(
                     input=original_code,
                     processed_input=processed_code,
+                    output_stats={name: {"written_chars": stream.written_chars,
+                                         "truncated": stream._truncated}
+                                  for name, stream in (("stdout", collector.stdout_stream),
+                                                       ("stderr", collector.stderr_stream))},
                     stdout=collector.get_stdout(),
                     stderr=collector.get_stderr(),
                     result=self.last_result,

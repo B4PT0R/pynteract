@@ -13,7 +13,7 @@ import pynteract
 from pynteract import ExecutionInterrupted, Shell
 
 assert str(wheel) in pynteract.__file__, pynteract.__file__
-assert importlib.metadata.version('pynteract') == '1.1.0'
+assert importlib.metadata.version('pynteract') == '1.2.0'
 with Shell(display_mode='none') as shell:
     response = shell.run('x = 41 + 1\nx')
     assert response.exception is None and response.result == 42
@@ -38,6 +38,11 @@ async def async_example():
         assert response.exception is None and response.result == 42
 
 asyncio.run(async_example())
+with Shell(capture_limit=3, hook_buffer=False, stdout_hook=lambda *_: None) as shell:
+    response = shell.run("print('abcdef')")
+    assert response.stdout.startswith('abc\n[output truncated:')
+    assert response.output_stats['stdout'] == {'written_chars': 7, 'truncated': True}
+
 entry = next(ep for ep in importlib.metadata.distribution('pynteract').entry_points
              if ep.group == 'console_scripts' and ep.name == 'pynteract')
 assert entry.load()(['--version']) == 0
