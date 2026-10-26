@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pynteract"
-version = "1.0.0"
+version = "1.1.0"
 description = "Lightweight embedded, cell-oriented Python shell (notebooks/agents) with minimal dependencies."
 readme = "README.md"
 license = "MIT"

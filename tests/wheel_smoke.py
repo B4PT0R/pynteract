@@ -10,10 +10,10 @@ assert wheel.is_file() and wheel.suffix == '.whl'
 sys.path.insert(0, str(wheel))
 
 import pynteract
-from pynteract import Shell
+from pynteract import ExecutionInterrupted, Shell
 
 assert str(wheel) in pynteract.__file__, pynteract.__file__
-assert importlib.metadata.version('pynteract') == '1.0.0'
+assert importlib.metadata.version('pynteract') == '1.1.0'
 with Shell(display_mode='none') as shell:
     response = shell.run('x = 41 + 1\nx')
     assert response.exception is None and response.result == 42
@@ -22,6 +22,15 @@ with Shell(display_mode='none') as shell:
     assert shell.run('raise ValueError("wheel-error")', silent=True).exception is not None
     shell.run('def example():\n    return 42')
     assert 'return 42' in inspect.getsource(shell.namespace['example'])
+    assert shell.interrupt() is False
+    shell.namespace['stop'] = shell.interrupt
+    try:
+        shell.run('kept = 42\nstop()')
+    except ExecutionInterrupted:
+        pass
+    else:
+        raise AssertionError('Expected ExecutionInterrupted from the built wheel')
+    assert shell.run('kept').result == 42
 
 async def async_example():
     with Shell(display_mode='none') as shell:

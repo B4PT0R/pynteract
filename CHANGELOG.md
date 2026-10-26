@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.1.0 - 2026-10-26
+
+- Add `Shell.interrupt()` and export `ExecutionInterrupted` for cooperative host
+  interruption without closing the shell or replacing its namespace. Support
+  async interruption from another task/thread and synchronous interruption from
+  the owning thread, without installing process-wide signal handlers.
+- Preserve completed namespace mutations and run cleanup on interruption. Keep
+  external async cancellation distinct and remove only cancellation issued by
+  the shell, including when user code suppresses it.
+- Document interruption limits and add regression coverage for signal delivery,
+  cross-thread calls, async cleanup, and shell reuse after interruption.
+
 ## 1.0.0 - 2026-10-25
 
 - Register terminal key bindings before first input, implement clipboard copy/cut, and stop retrying terminal initialization failures. Include Pygments in the terminal extra. Respect startup encoding declarations, handle optional config/read errors once, and avoid repeating announced failures. Add startup/terminal regressions, Linux multi-Python CI and built-wheel smoke checks.
