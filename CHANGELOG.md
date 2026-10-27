@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.2.0 - Unreleased
+## 1.2.0 - 2026-10-27
 
 - Add opt-in `Shell(capture_limit=...)` per-stream, per-run prefix capture with
   one visible overflow marker and actual written-character statistics. Bound
