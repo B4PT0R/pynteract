@@ -13,7 +13,7 @@ import pynteract
 from pynteract import ExecutionInterrupted, Shell
 
 assert str(wheel) in pynteract.__file__, pynteract.__file__
-assert importlib.metadata.version('pynteract') == '1.2.0'
+assert importlib.metadata.version('pynteract') == '1.3.0'
 with Shell(display_mode='none') as shell:
     response = shell.run('x = 41 + 1\nx')
     assert response.exception is None and response.result == 42
@@ -36,6 +36,8 @@ async def async_example():
     with Shell(display_mode='none') as shell:
         response = await shell.arun('import asyncio\nawait asyncio.sleep(0)\n42')
         assert response.exception is None and response.result == 42
+        command = await shell.arun('!!printf wheel-async-ok')
+        assert command.exception is None and command.result == 'wheel-async-ok'
 
 asyncio.run(async_example())
 with Shell(capture_limit=3, hook_buffer=False, stdout_hook=lambda *_: None) as shell:

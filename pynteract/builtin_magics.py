@@ -155,9 +155,15 @@ def register_builtin_magics(shell: "Shell") -> None:
         best = min(runs) / n
         return f"Best of {r}: {best:.6g}s per loop"
 
-    @shell.register_magic(name="bash", mode="cell")
     def _bash_cell(script: str) -> int:
         return shell._run_process(["bash", "-lc", script])
+
+    async def _abash_cell(script: str) -> int:
+        return await shell._arun_process(["bash", "-lc", script])
+
+    shell.register_magic(
+        _bash_cell, name="bash", mode="cell", async_func=_abash_cell
+    )
 
     @shell.register_magic(name="run", mode="line")
     def _run(arg: str) -> str | None:

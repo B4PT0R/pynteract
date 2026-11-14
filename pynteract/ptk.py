@@ -49,6 +49,32 @@ class PtkSession:
                 lexer=self._lexer,
             )
 
+    async def prompt_async(
+        self,
+        *,
+        message: str,
+        multiline: bool,
+        prompt_continuation: str,
+        wrap_lines: bool,
+    ) -> str:
+        try:
+            from prompt_toolkit.patch_stdout import patch_stdout
+        except ImportError as exc:
+            raise RuntimeError(
+                "prompt_toolkit is required for terminal interactive shell mode. "
+                "Install it via 'pip install \"pynteract[terminal]\"' (or 'pip install prompt-toolkit')."
+            ) from exc
+
+        with patch_stdout():
+            return await self._session.prompt_async(
+                message=message,
+                multiline=multiline,
+                prompt_continuation=prompt_continuation,
+                wrap_lines=wrap_lines,
+                refresh_interval=1,
+                lexer=self._lexer,
+            )
+
 
 def _split_lines_keepends(text: str) -> list[str]:
     # Python's splitlines(keepends=True) loses the last empty line marker; this is fine for our use.
@@ -481,6 +507,26 @@ def prompt(
         raise ValueError("highlighting must be 'text' or 'python'")
     session = _get_ptk_session(highlighting)
     return session.prompt(
+        message=prompt,
+        multiline=multiline,
+        prompt_continuation=prompt_continuation,
+        wrap_lines=wrap_lines,
+    )
+
+
+async def prompt_async(
+    prompt: str,
+    multiline: bool = True,
+    prompt_continuation: str = "",
+    wrap_lines: bool = False,
+    *,
+    highlighting: str = "text",
+) -> str:
+    """Asynchronously read user input using prompt_toolkit."""
+    if highlighting not in ("text", "python"):
+        raise ValueError("highlighting must be 'text' or 'python'")
+    session = _get_ptk_session(highlighting)
+    return await session.prompt_async(
         message=prompt,
         multiline=multiline,
         prompt_continuation=prompt_continuation,

@@ -104,9 +104,11 @@ expression such as `some_async_function()` returns its coroutine object; write
 objects, and caller `ContextVar` changes follow normal same-task semantics.
 `run()` remains synchronous and does not accept top-level await.
 
-**Blocking code still blocks.** A cell's `time.sleep()`, synchronous `input()`,
-CPU work, system commands and ordinary hooks run synchronously. For deliberately
-blocking cells, opt into a worker yourself:
+**Blocking Python still blocks.** A cell's `time.sleep()`, synchronous `input()`,
+CPU work and ordinary synchronous hooks run in the caller's task. `!`, `!!` and
+`%%bash` use asyncio subprocesses under `arun()` and stream output without
+blocking the event loop. For deliberately blocking cells, opt into a worker
+yourself:
 
 ```python
 response = await asyncio.to_thread(shell.run, "blocking_function()")
@@ -142,7 +144,8 @@ propagates as `asyncio.CancelledError`. Synchronous code blocks its event loop;
 to interrupt it, the host must call from its owning thread (for example a
 host-installed Python signal handler). Foreign-thread synchronous interruption
 is rejected rather than injecting unsafe exceptions. The library installs no
-process-wide signal handlers and does not send OS signals itself.
+process-wide signal handlers. Cancelling an async system command terminates its
+owned process group on POSIX, or its direct child on Windows.
 
 This is cooperative, best-effort interruption, not forced termination: native
 calls can delay it and user code can catch/ignore it. Cleanup follows ordinary
@@ -264,6 +267,11 @@ def caps(text: str) -> str:
 assert shell.run("%caps hello").result == "HELLO"
 ```
 
+For a magic that has distinct blocking and non-blocking implementations, pass
+the latter as `async_func`; `run()` uses `func`, while `arun()` awaits
+`async_func`. A directly registered `async def` magic is available through
+`arun()` and produces a clear error if called through `run()`.
+
 ### Magic forms
 
 - Line magic: `%name rest of line`
@@ -318,9 +326,11 @@ process-wide, not safe isolation from unrelated threads. Imported modules remain
 cached as in ordinary Python. The CLI maps `SystemExit` to an exit status and
 preserves script state through `-i` only until the interactive session exits.
 
-System commands are blocking, even inside `arun()`. Reader/hook failures propagate
-after child cleanup. POSIX cleanup terminates the owned process group; on Windows
-it terminates only the direct child (descendant-tree cleanup is not guaranteed).
+System commands use blocking subprocesses in `run()` and asyncio subprocesses in
+`arun()`. Both paths stream stdout/stderr, propagate reader or hook failures only
+after child cleanup, and preserve `!!` stdout capture. POSIX cleanup terminates
+the owned process group; on Windows it terminates only the direct child
+(descendant-tree cleanup is not guaranteed).
 
 ## Hooks
 
@@ -366,8 +376,9 @@ capture, not caller-created strings, custom hooks, user threads or process RSS.
 
 Only `stdout_hook` and `stderr_hook` may be async (`async def`, including async
 `__call__` objects), and only with `arun()` or `async with Collector(...)`.
-All other hooks, magics and stdin providers are synchronous; accidental awaitable
-hook returns raise `TypeError` instead of leaking an unawaited coroutine.
+All other hooks and stdin providers are synchronous; magics use the explicit
+`async_func` path described above. Accidental awaitable hook returns raise
+`TypeError` instead of leaking an unawaited coroutine.
 
 ```python
 import asyncio
@@ -408,6 +419,10 @@ from pynteract import Shell
 Shell().interact()
 ```
 
+Inside an existing event loop, use `await Shell().ainteract()`. Input is read
+with prompt_toolkit's async prompt and submitted cells run through `arun()`, so
+top-level await and async system commands remain native to the caller's loop.
+
 Use **Alt+Enter** to submit, **Enter** for a new line, and **Tab / Shift+Tab**
 for indentation. **Ctrl+C** copies a selection, or interrupts when there is none;
 **Ctrl+X / Ctrl+V** cut and paste. Missing terminal dependencies or an input
@@ -425,8 +440,9 @@ Interactive sessions store prompt histories under `~/.pynteract/` (or `PYNTERACT
 If present and non-empty, `~/.pynteract/startup.py` is executed at the start of interactive sessions.
 
 - The startup file is read as Python source (encoding cookies and BOMs supported),
-  then executed once per Shell via `Shell.run(..., silent=True)`, so magics/system
-  commands are supported. Restarting the session explicitly reruns it.
+  then executed once per Shell via `run(..., silent=True)` for `interact()` or
+  `arun(..., silent=True)` for `ainteract()`. The async path supports top-level
+  await. Restarting the session explicitly reruns it.
 - An unreadable or undecodable optional startup file emits a warning and is skipped;
   its bytes are never silently replaced.
 - If the startup fails, Pynteract prints the enriched traceback and exits (non-zero status in the CLI).
@@ -439,6 +455,9 @@ In interactive mode, you can reset the namespace and rerun startup:
 ```python
 __shell__.restart_session()
 ```
+
+From async code, `await __shell__.arestart_session()` performs the same reset and
+reruns startup through `arun()`.
 
 ## CLI
 
@@ -529,12 +548,14 @@ Key methods:
 | Execute | `run(code, globals=None, locals=None, silent=None, filename=None, cwd=None) -> ShellResponse` | `cwd` selects the run working directory. By default (`use_internal_cwd=False`), runs share/mutate the ambient process cwd. Opt-in `True` temporarily applies the saved shell cwd and restores the caller cwd; both it and an explicit `cwd` require exclusive execution. |
 | Async execute | `await arun(code, globals=None, locals=None, silent=None, filename=None, cwd=None) -> ShellResponse` | Native-loop counterpart with top-level await; sync work still blocks. |
 | Interactive | `interact() -> int` | Terminal REPL; returns process-like exit code. |
+| Async interactive | `await ainteract() -> int` | Async terminal REPL; submitted cells and startup use `arun()`. |
 | Lifetime | `close()` / `with Shell() as shell:` | Releases owned module/source registrations; `closed` reports state. |
 | Restart | `restart_session(rerun_startup=True, announce=True) -> int` | Resets namespace and (optionally) reruns startup. |
+| Async restart | `await arestart_session(rerun_startup=True, announce=True) -> int` | Async restart; startup may use top-level await. |
 | Namespace | `update_namespace(**kwargs)` | Adds symbols to the execution namespace. |
 | Namespace | `set_namespace(namespace: dict)` | Switches to a different dict namespace. |
 | Namespace | `reset_namespace()` | Clears user symbols and resets `__future__` flags. |
-| Magics | `register_magic(func=None, *, name=None, mode="both")` | Decorator or direct call; mode `"line"|"cell"|"both"`. |
+| Magics | `register_magic(func=None, *, name=None, mode="both", async_func=None)` | Decorator or direct call; optional async implementation is awaited by `arun()`. |
 | Threads | `enable_stdio_proxy()` | Installs a routing proxy on `sys.stdout`/`sys.stderr` for late-thread capture. |
 | Threads | `capture_context(name=None) -> contextvars.Context` | Capture routing context for another thread. |
 | Builtins | `ensure_builtins()` | (Re)adds `__shell__`, `__magics__`, `display`, and built-in magics. |

@@ -79,10 +79,10 @@ import io
 
 from typing import Any, Callable, Optional, Union, Literal
 from .utils import short_id, call_sync_hook
-from .processes import run_streamed
+from .processes import run_streamed, run_streamed_async
 from .sources import SourceCache
 from .scripts import read_script
-from .ptk import prompt
+from .ptk import prompt, prompt_async
 from .collector import Collector
 from .magics import MagicParser, Magic
 from . import namespace_utils
@@ -384,6 +384,30 @@ class Shell:
         Returns:
             int: 0 on success, 1 if startup fails.
         """
+        self._reset_session_namespace()
+        if not rerun_startup:
+            return 0
+
+        self._reset_startup_state()
+        return self._run_startup(announce=announce)
+
+    async def arestart_session(
+        self, *, rerun_startup: bool = True, announce: bool = True,
+    ) -> int:
+        """Async counterpart to :meth:`restart_session`.
+
+        Startup code runs through :meth:`arun`, so it may use top-level await
+        and does not block the caller's event loop.
+        """
+        self._reset_session_namespace()
+        if not rerun_startup:
+            return 0
+
+        self._reset_startup_state()
+        return await self._arun_startup(announce=announce)
+
+    def _reset_session_namespace(self) -> None:
+        """Reset user state while preserving the interactive exit callback."""
         preserved: dict[str, Any] = {}
         exit_fn = self.namespace.get("exit")
         if callable(exit_fn):
@@ -393,12 +417,6 @@ class Shell:
 
         if preserved:
             self.update_namespace(**preserved)
-
-        if not rerun_startup:
-            return 0
-
-        self._reset_startup_state()
-        return self._run_startup(announce=announce)
 
     def enable_stdio_proxy(self) -> None:
         """Install a routing proxy on sys.stdout/sys.stderr for thread-aware capture."""
@@ -472,24 +490,34 @@ class Shell:
         )
 
 
-    def register_magic(self, func=None, *, name=None, mode: Literal["line", "cell", "both"] = "both"):
+    def register_magic(
+        self,
+        func=None,
+        *,
+        name=None,
+        mode: Literal["line", "cell", "both"] = "both",
+        async_func=None,
+    ):
         """Registers a magic function.
         Args:
             func (callable): The function to register as a magic.
             name (str, optional): The name of the magic. If None, uses func.__name__.
             mode (str): One of 'line', 'cell', 'both' to control which syntax is allowed.
+            async_func (callable, optional): Implementation used by ``arun()``.
         Returns:
             callable: The registered magic function.
         """
         if func is None:
-            return lambda f: self.register_magic(f, name=name, mode=mode)
+            return lambda f: self.register_magic(
+                f, name=name, mode=mode, async_func=async_func
+            )
         if mode not in ("line", "cell", "both"):
             raise ValueError("mode must be one of: 'line', 'cell', 'both'")
         name = name or func.__name__
-        self.magics[name] = Magic(func=func, mode=mode)
+        self.magics[name] = Magic(func=func, mode=mode, async_func=async_func)
         return func
 
-    def _call_magic(self, name: str, kind: Literal["line", "cell"], text: str) -> Any:
+    def _get_magic(self, name: str, kind: Literal["line", "cell"]) -> Magic:
         magic = self.magics.get(name)
         if magic is None:
             raise KeyError(f"Unknown magic: {name}")
@@ -499,8 +527,21 @@ class Shell:
             raise ValueError(f"Magic %{name} does not support line mode")
         if kind == "cell" and magic_mode not in ("cell", "both"):
             raise ValueError(f"Magic %%{name} does not support cell mode")
+        return magic
 
-        return magic(text)
+    def _call_magic(self, name: str, kind: Literal["line", "cell"], text: str) -> Any:
+        magic = self._get_magic(name, kind)
+        result = magic(text)
+        if inspect.isawaitable(result):
+            if inspect.iscoroutine(result):
+                result.close()
+            raise TypeError(f"Magic %{name} is asynchronous; use Shell.arun()")
+        return result
+
+    async def _acall_magic(
+        self, name: str, kind: Literal["line", "cell"], text: str,
+    ) -> Any:
+        return await self._get_magic(name, kind).acall(text)
 
     def _normalize_cwd(self, cwd: str | os.PathLike[str] | None) -> str:
         if cwd is None:
@@ -522,6 +563,9 @@ class Shell:
             prepare_thread = lambda thread: call_sync_hook(add_hook, thread, ctx)
         return run_streamed(command, shell=shell, stdout=stdout, prepare_thread=prepare_thread)
 
+    async def _arun_process(self, command, *, shell=False, stdout=None):
+        return await run_streamed_async(command, shell=shell, stdout=stdout)
+
     def run_system_cmd(self, command):
         """Run a blocking system command, streaming IO and propagating delivery errors."""
         return self._run_process(command, shell=True)
@@ -530,6 +574,16 @@ class Shell:
         """Return stdout (``!!``), streaming stderr; failures still clean up the child."""
         output = io.StringIO()
         self._run_process(command, shell=True, stdout=output)
+        return output.getvalue()
+
+    async def arun_system_cmd(self, command):
+        """Run a system command without blocking the caller's event loop."""
+        return await self._arun_process(command, shell=True)
+
+    async def arun_system_cmd_capture(self, command: str) -> str:
+        """Asynchronously capture stdout (``!!``) while streaming stderr."""
+        output = io.StringIO()
+        await self._arun_process(command, shell=True, stdout=output)
         return output.getvalue()
 
 
@@ -694,7 +748,7 @@ class Shell:
                     self._execution_owner = None
 
     @contextmanager
-    def _run_scope(self, code, globals, locals, silent, filename, cwd):
+    def _run_scope(self, code, globals, locals, silent, filename, cwd, *, allow_await=False):
         previous_process_cwd = os.path.abspath(os.getcwd())
         run_cwd = self._normalize_cwd(cwd)
         if self.use_internal_cwd or cwd is not None:
@@ -713,8 +767,8 @@ class Shell:
             exec_globals, exec_locals, is_session_namespace = self._select_exec_context(globals, locals)
 
             with self._magic_parser._placeholder_scope():
-                code = self._magic_parser._parse_system_cmd(code)
-                code = self._magic_parser._parse_magics(code)
+                code = self._magic_parser._parse_system_cmd(code, async_mode=allow_await)
+                code = self._magic_parser._parse_magics(code, async_mode=allow_await)
 
                 pre_run_hook = self.hooks.get("pre_run_hook")
                 if pre_run_hook:
@@ -800,7 +854,9 @@ class Shell:
         Returns:
             ShellResponse: An object containing the results of the execution.
         """
-        with self._execution_scope(cwd), self._run_scope(code, globals, locals, silent, filename, cwd) as state:
+        with self._execution_scope(cwd), self._run_scope(
+            code, globals, locals, silent, filename, cwd, allow_await=False
+        ) as state:
             with state.collector:
                 for node, source, suppressed, last in self._iter_nodes(state.code, filename=state.filename):
                     node, compiled, expression = self._compile_node(node, source)
@@ -818,7 +874,9 @@ class Shell:
         Concurrent cells require separate shells with ``use_internal_cwd=False``
         and no explicit ``cwd``. Process cwd mutations are never task-local.
         """
-        with self._execution_scope(cwd), self._run_scope(code, globals, locals, silent, filename, cwd) as state:
+        with self._execution_scope(cwd), self._run_scope(
+            code, globals, locals, silent, filename, cwd, allow_await=True
+        ) as state:
             async with state.collector:
                 for node, source, suppressed, last in self._iter_nodes(state.code, filename=state.filename, allow_await=True):
                     node, compiled, expression = self._compile_node(node, source, allow_await=True)
@@ -902,11 +960,70 @@ class Shell:
         print("Exiting interactive shell.")
         return 0
 
+    async def ainteract(self) -> int:
+        """Run the terminal REPL without blocking the caller's event loop."""
+        print("Welcome to Pynteract's Interactive Shell.")
+        print(f"Python {sys.version.split()[0]}")
+
+        startup_exit = await self._arun_startup(announce=True)
+        if startup_exit != 0:
+            return startup_exit
+
+        print("Use Alt+Enter to submit your input.")
+        print("Type 'exit()' to exit the shell.")
+
+        loop = True
+
+        def custom_exit():
+            nonlocal loop
+            loop = False
+
+        self.update_namespace(exit=custom_exit)
+
+        while loop:
+            try:
+                code = await prompt_async(">>> ", prompt_continuation="... ", highlighting="python")
+            except KeyboardInterrupt:
+                print("\nKeyboardInterrupt")
+            except EOFError:
+                break
+            except Exception as exc:
+                print(f"pynteract: terminal input failed: {exc}", file=sys.stderr)
+                return 1
+            else:
+                try:
+                    await self.arun(code)
+                except KeyboardInterrupt:
+                    print("\nKeyboardInterrupt")
+
+        print("Exiting interactive shell.")
+        return 0
+
     def _run_startup(self, *, announce: bool) -> int:
         """Run `~/.pynteract/startup.py` once per Shell instance.
 
         Returns a process-like exit code: 0 on success/no startup, 1 on failure.
         """
+        prepared = self._prepare_startup(announce=announce)
+        if isinstance(prepared, int):
+            return prepared
+        path, code = prepared
+        response = self.run(code, silent=True, filename=str(path))
+        return self._finish_startup(response, path=path, announce=announce)
+
+    async def _arun_startup(self, *, announce: bool) -> int:
+        """Run startup through the native async execution path."""
+        prepared = self._prepare_startup(announce=announce)
+        if isinstance(prepared, int):
+            return prepared
+        path, code = prepared
+        response = await self.arun(code, silent=True, filename=str(path))
+        return self._finish_startup(response, path=path, announce=announce)
+
+    def _prepare_startup(
+        self, *, announce: bool,
+    ) -> tuple[str | os.PathLike[str], str] | int:
+        """Read startup once, returning an exit code or executable source."""
         if self._startup_ran:
             if announce and self._startup_has_source and not self._startup_announced:
                 print("Running startup...")
@@ -936,8 +1053,16 @@ class Shell:
         if announce:
             print("Running startup...")
             self._startup_announced = True
+        return path, code
 
-        response = self.run(code, silent=True, filename=str(path))
+    def _finish_startup(
+        self,
+        response: ShellResponse,
+        *,
+        path: str | os.PathLike[str],
+        announce: bool,
+    ) -> int:
+        """Record and report a startup execution result."""
         if response.exception is None:
             if announce:
                 print("Ready!")

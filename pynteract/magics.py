@@ -1,6 +1,7 @@
 from .utils import short_id
 from contextlib import contextmanager
 import contextvars
+import inspect
 import tokenize
 import io
 import re
@@ -40,9 +41,16 @@ _TEMPLATE_SAFE_BUILTINS: dict[str, Any] = {
 class Magic:
     func: Callable[[str], Any]
     mode: Literal["line", "cell", "both"] = "both"
+    async_func: Callable[[str], Any] | None = None
 
     def __call__(self, text: str) -> Any:
         return self.func(text)
+
+    async def acall(self, text: str) -> Any:
+        result = (self.async_func or self.func)(text)
+        if inspect.isawaitable(result):
+            return await result
+        return result
 
 
 class MagicParser:
@@ -183,7 +191,7 @@ class MagicParser:
             return idx, magic, rhs
         return None
 
-    def _parse_system_cmd(self, code: str) -> str:
+    def _parse_system_cmd(self, code: str, *, async_mode: bool = False) -> str:
         """Transform shell-escape syntax (``!cmd``, ``!!cmd``) into __shell__ calls."""
         store = self._current_placeholders()
         stripped_code = code.lstrip("\n")
@@ -193,8 +201,10 @@ class MagicParser:
             command = stripped_code[2:].lstrip("\n")
             pid = short_id()
             store[pid] = command
+            method = "arun_system_cmd_capture" if async_mode else "run_system_cmd_capture"
+            prefix = "await " if async_mode else ""
             return (
-                f"__shell__.run_system_cmd_capture("
+                f"{prefix}__shell__.{method}("
                 f"__shell__._magic_parser._render_placeholder('{pid}', globals(), locals()))"
             )
 
@@ -210,15 +220,19 @@ class MagicParser:
                 command = stripped_line[1:].lstrip()
                 pid = short_id()
                 store[pid] = command
+                method = "arun_system_cmd" if async_mode else "run_system_cmd"
+                prefix = "await " if async_mode else ""
                 lines[i] = (
-                    f"{indent}__shell__.run_system_cmd("
+                    f"{indent}{prefix}__shell__.{method}("
                     f"__shell__._magic_parser._render_placeholder('{pid}', globals(), locals()))"
                 )
         return "\n".join(lines)
 
-    def _parse_magics(self, code: str) -> str:
+    def _parse_magics(self, code: str, *, async_mode: bool = False) -> str:
         """Transform ``%magic`` / ``%%magic`` syntax into __shell__ calls."""
         store = self._current_placeholders()
+        method = "_acall_magic" if async_mode else "_call_magic"
+        prefix = "await " if async_mode else ""
         stripped_code = code.lstrip("\n")
         if stripped_code.startswith("%%"):
             lines = stripped_code.split("\n")
@@ -227,7 +241,7 @@ class MagicParser:
             pid = short_id()
             store[pid] = content
             return (
-                f"__shell__._call_magic('{magic}', 'cell', "
+                f"{prefix}__shell__.{method}('{magic}', 'cell', "
                 f"__shell__._magic_parser._render_placeholder('{pid}', globals(), locals()))"
             )
 
@@ -246,7 +260,7 @@ class MagicParser:
                 pid = short_id()
                 store[pid] = content
                 lines[i] = (
-                    f"{indent}__shell__._call_magic('{magic}', 'line', "
+                    f"{indent}{prefix}__shell__.{method}('{magic}', 'line', "
                     f"__shell__._magic_parser._render_placeholder('{pid}', globals(), locals()))"
                 )
                 continue
@@ -259,7 +273,7 @@ class MagicParser:
             store[pid] = content
             left = line[:column]
             replacement = (
-                f"__shell__._call_magic('{magic}', 'line', "
+                f"{prefix}__shell__.{method}('{magic}', 'line', "
                 f"__shell__._magic_parser._render_placeholder('{pid}', globals(), locals()))"
             )
             lines[i] = f"{left}{replacement}"

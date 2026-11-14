@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.3.0 - 2026-11-14
+
+- Add a native async terminal path with `Shell.ainteract()` and prompt_toolkit's
+  async prompt, including top-level await in submitted cells and startup files.
+- Run `!`, `!!` and `%%bash` through asyncio subprocesses under `arun()`, with
+  streamed output, ordered capture, cancellation cleanup and owned child-process
+  termination. Keep their blocking behavior under `run()`.
+- Add optional async magic implementations via `register_magic(...,
+  async_func=...)`, plus `Shell.arestart_session()` for async startup reruns.
+
 ## 1.2.0 - 2026-10-27
 
 - Add opt-in `Shell(capture_limit=...)` per-stream, per-run prefix capture with
